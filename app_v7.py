@@ -1467,7 +1467,7 @@ def app_header(bp: str) -> None:
     <div style="display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end;">
       {chip("🥕","XP", str(carrots))}
       {chip("🥐","Level", str(level))}
-      {chip("🚬","Cigarettes", str(cigarettes))}
+      {chip("🚬","Cig", str(cigarettes))}
     </div>
   </div>
 </div>
