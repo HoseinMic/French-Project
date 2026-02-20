@@ -32,7 +32,19 @@ HTTP_HEADERS = {
     "Accept": "application/json,text/plain;q=0.9,*/*;q=0.8",
 }
 
-st.set_page_config(page_title=APP_TITLE, page_icon="🇫🇷", layout="wide")
+# st.set_page_config(page_title=APP_TITLE, page_icon="🇫🇷", layout="wide")
+
+# st.set_page_config(layout="wide")  # keep wide, then cap container with CSS
+
+st.markdown("""
+<style>
+/* Main content container max width */
+section.main > div { max-width: 1080px; margin: 0 auto; }
+
+/* Optional: reduce side padding */
+section.main { padding-left: 1rem; padding-right: 1rem; }
+</style>
+""", unsafe_allow_html=True)
 
 # =========================
 # Theme tokens
@@ -375,8 +387,8 @@ div[data-testid="stRadio"] label > div:first-child {{ display: none !important; 
 div[data-testid="stRadio"] label {{
   background: transparent;
   border-radius: 999px;
-  padding: 10px 14px;
-  margin: 4px 4px;
+  padding: 10px 18px;
+  margin: 4px 8.5px;
   transition: transform .10s ease, background .12s ease, filter .12s ease;
   color: var(--mut);
   font-weight: 950;
@@ -1458,7 +1470,7 @@ def app_header(bp: str) -> None:
     with st.container():
         st.markdown(
             f"""
-<div class="card" style="padding:14px 16px; margin-bottom:10px;">
+<div class="card" style="padding:14px 14px; margin-bottom:10px;">
   <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;">
     <div>
       <div style="font-weight:1000; font-size:22px; letter-spacing:.2px;">Charlot</div>
