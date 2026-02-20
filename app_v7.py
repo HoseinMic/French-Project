@@ -1,10 +1,19 @@
+
 import csv
 import io
+
+import re
+try:
+    import fitz  # PyMuPDF
+except Exception:
+    fitz = None
 import json
 import sqlite3
 import textwrap
+import base64
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 import requests
 import streamlit as st
@@ -20,14 +29,14 @@ DICTAPI_BASE = "https://api.dictionaryapi.dev/api/v2/entries"
 WIKTIONARY_BASE = {"fr": "https://fr.wiktionary.org", "en": "https://en.wiktionary.org"}
 
 HTTP_HEADERS = {
-    "User-Agent": "FrenchStudyHub/4.0 (Streamlit; educational app)",
+    "User-Agent": "Charlot/9.0 (Streamlit; educational app)",
     "Accept": "application/json,text/plain;q=0.9,*/*;q=0.8",
 }
 
 st.set_page_config(page_title=APP_TITLE, page_icon="🇫🇷", layout="wide")
 
 # =========================
-# Theme (Modern / Clean)
+# Theme tokens
 # =========================
 THEMES = {
     "Dark": {
@@ -37,7 +46,7 @@ THEMES = {
         "surface2": "rgba(255,255,255,.04)",
         "txt": "rgba(255,255,255,.92)",
         "mut": "rgba(255,255,255,.66)",
-        "mut2": "rgba(255,255,255,.48)",
+        "mut2": "rgba(255,255,255,.46)",
         "line": "rgba(255,255,255,.10)",
         "brand": "#58cc02",
         "brand2": "#1cb0f6",
@@ -68,39 +77,53 @@ THEMES = {
     },
 }
 
+PAGES = [
+    ("🏠", "Home"),
+    ("📚", "Dictionary"),
+    ("🧠", "Review"),
+    ("🗂️", "Cards"),
+    ("📝", "Notebook"),
+    ("🔁", "Import/Export"),
+    ("⚙️", "Settings"),
+    ("❓", "About"),
+]
 
+# =========================
+# Session state
+# =========================
 def init_session_state() -> None:
-    if "nav" not in st.session_state:
-        st.session_state.nav = "Home"
-    if "theme" not in st.session_state:
-        st.session_state.theme = "Dark"
-    if "xp" not in st.session_state:
-        st.session_state.xp = 0
-    if "streak" not in st.session_state:
-        st.session_state.streak = 1
-    if "last_xp_date" not in st.session_state:
-        st.session_state.last_xp_date = iso_date(today_utc_date())
-    if "review_idx" not in st.session_state:
-        st.session_state.review_idx = 0
-    if "edit_card_id" not in st.session_state:
-        st.session_state.edit_card_id = None
+    ss = st.session_state
+    ss.setdefault("nav", "Home")
+    ss.setdefault("theme", "Dark")
+    ss.setdefault("xp", 0)
+    ss.setdefault("streak", 1)
+    ss.setdefault("last_xp_date", iso_date(today_utc_date()))
+    ss.setdefault("review_idx", 0)
+    ss.setdefault("edit_card_id", None)
+    ss.setdefault("selected_card_id", None)
+    ss.setdefault("scroll_to_selected_card", False)
+    ss.setdefault("scroll_to_editor", False)
+    ss.setdefault("delete_confirm_id", None)
+    ss.setdefault("cards_page", 1)
+    ss.setdefault("cards_page_size", 18)
+    ss.setdefault("global_query", "")
+    ss.setdefault("nb_pdf_book_id", None)
+    ss.setdefault("nb_pdf_page", 1)
+    ss.setdefault("nb_pdf_zoom", 100)
+    ss.setdefault("nb_vocab_q", "")
+    ss.setdefault("nb_pdf_text_cache_page", None)
+    ss.setdefault("nb_pdf_extracted_text", "")
 
-
-
+# =========================
+# Responsive breakpoint
+# =========================
 def detect_breakpoint(breakpoint_px: int = 760) -> str:
-    """
-    Returns "m" (mobile) or "d" (desktop) based on a client-side width probe stored in URL query param `bp`.
-    We update `bp` with a tiny JS snippet that reloads ONLY when crossing the breakpoint.
-    """
-    import streamlit.components.v1 as components
-
-    # Read current bp from query params (supports old/new Streamlit APIs)
+    """Return 'm' (mobile) or 'd' (desktop) using a query-param probe."""
     try:
         bp = st.query_params.get("bp", None)
     except Exception:
         bp = st.experimental_get_query_params().get("bp", [None])[0]
 
-    # JS computes bp and reloads only if it changed (crossed breakpoint or missing)
     components.html(
         f"""
 <script>
@@ -117,13 +140,13 @@ def detect_breakpoint(breakpoint_px: int = 760) -> str:
 """,
         height=0,
     )
-
-    # If bp is missing, we just triggered a reload; return a safe default for this run
     return bp or "d"
 
+# =========================
+# CSS
+# =========================
 def inject_global_css(theme_name: str) -> None:
-    t = THEMES.get(theme_name, THEMES["Light"])
-
+    t = THEMES.get(theme_name, THEMES["Dark"])
     css = f"""
 <style>
 :root {{
@@ -147,6 +170,7 @@ def inject_global_css(theme_name: str) -> None:
   --r16:16px;
   --r20:20px;
   --r24:24px;
+  --r28:28px;
 }}
 
 html, body, [class*="css"] {{
@@ -161,7 +185,7 @@ html, body, [class*="css"] {{
 }}
 
 .block-container {{
-  padding-top: 1.0rem;
+  padding-top: .9rem;
   padding-bottom: 4.0rem;
   max-width: 1200px;
 }}
@@ -170,15 +194,18 @@ header[data-testid="stHeader"]{{ background: rgba(0,0,0,0); }}
 div[data-testid="stToolbar"]{{ visibility: hidden; height: 0px; }}
 footer{{ visibility:hidden; }}
 
-::selection {{
-  background: rgba(88,204,2,.22);
+::selection {{ background: rgba(88,204,2,.22); }}
+
+/* Prevent button labels from wrapping character-by-character on narrow cards */
+div.stButton > button, div.stButton > button * {{
+  white-space: nowrap !important;
 }}
 
 @keyframes fadeIn {{
   from {{ opacity: 0; transform: translateY(10px); }}
   to   {{ opacity: 1; transform: translateY(0px); }}
 }}
-.page {{ animation: fadeIn .20s ease-out; }}
+.page {{ animation: fadeIn .18s ease-out; }}
 
 .card {{
   background: linear-gradient(180deg, var(--surface), var(--surface2));
@@ -187,27 +214,9 @@ footer{{ visibility:hidden; }}
   box-shadow: var(--sh2);
   padding: 18px 18px;
 }}
-.card-tight {{
-  border-radius: var(--r20);
-  padding: 14px 16px;
-}}
-.card-header {{
-  display:flex;
-  justify-content:space-between;
-  align-items:flex-start;
-  gap:12px;
-}}
-.h-title {{
-  font-weight: 950;
-  font-size: 18px;
-  letter-spacing: .2px;
-}}
-.h-sub {{
-  color: var(--mut);
-  margin-top: 2px;
-  font-size: 13px;
-  line-height: 1.35;
-}}
+.card-tight {{ border-radius: var(--r20); padding: 14px 16px; }}
+.h-title {{ font-weight: 950; font-size: 18px; letter-spacing: .2px; }}
+.h-sub {{ color: var(--mut); margin-top: 2px; font-size: 13px; line-height: 1.35; }}
 
 .chip {{
   display:inline-flex; align-items:center; gap:8px;
@@ -217,71 +226,133 @@ footer{{ visibility:hidden; }}
   padding: 7px 12px;
   color: var(--mut);
   font-size: 13px;
-  font-weight: 800;
+  font-weight: 850;
 }}
-.chip b {{ color: var(--txt); font-weight: 950; }}
+.chip b {{ color: var(--txt); font-weight: 1000; }}
+.small {{ font-size: 13px; color: var(--mut); }}
 
 hr {{ border-color: var(--line) !important; }}
 
-/* Inputs + form controls */
 div[data-testid="stWidgetLabel"] label {{
   color: var(--mut) !important;
   font-weight: 850 !important;
 }}
-div[data-testid="stWidgetLabel"] label p,
-div[data-testid="stWidgetLabel"] label span {{
-  color: var(--mut) !important;
-}}
 
+/* ===== Inputs: simple + flat ===== */
 .stTextInput input,
 .stTextArea textarea,
 .stDateInput input,
 .stNumberInput input {{
   color: var(--txt) !important;
-  background: linear-gradient(180deg, var(--surface), var(--surface2)) !important;
+  background: var(--surface) !important;
   border: 1px solid var(--line) !important;
   border-radius: var(--r12) !important;
-}}
-.stTextInput input::placeholder,
-.stTextArea textarea::placeholder {{
-  color: var(--mut2) !important;
+  box-shadow: none !important;
 }}
 
+.stTextInput input:focus,
+.stTextArea textarea:focus,
+.stDateInput input:focus,
+.stNumberInput input:focus {{
+  border-color: var(--brand2) !important;
+  outline: none !important;
+  box-shadow: none !important;
+}}
+
+/* Select boxes: match inputs */
 div[data-baseweb="select"] > div {{
   border-radius: var(--r12) !important;
-  background: linear-gradient(180deg, var(--surface), var(--surface2)) !important;
+  background: var(--surface) !important;
   border: 1px solid var(--line) !important;
+  box-shadow: none !important;
 }}
-div[data-baseweb="select"] * {{
-  color: var(--txt) !important;
-}}
+div[data-baseweb="select"] * {{ color: var(--txt) !important; }}
 
-/* Buttons (clean + tactile) */
-.stButton>button, .stDownloadButton>button {{
-  border-radius: 999px !important;
-  border: 1px solid var(--chipb) !important;
-  background: var(--chip) !important;
+/* Buttons — Duolingo-like (chunky + pressed) */
+.stButton>button, .stDownloadButton>button{{
+  border-radius: 16px !important;
+  border: 2px solid rgba(0,0,0,0) !important;
+  background: linear-gradient(180deg, var(--surface), var(--surface2)) !important;
   color: var(--txt) !important;
-  box-shadow: 0 10px 22px rgba(0,0,0,.12);
-  transition: transform .10s ease, filter .10s ease, background .12s ease;
-  font-weight: 900 !important;
+  font-weight: 1000 !important;
+  letter-spacing: .2px !important;
+  padding: .58rem 1.05rem !important;
+  min-height: 44px !important;
+  box-shadow:
+    0 6px 0 rgba(0,0,0,.22),
+    0 16px 26px rgba(0,0,0,.18) !important;
+  transition: transform .08s ease, filter .10s ease, box-shadow .10s ease !important;
 }}
-.stButton>button:hover, .stDownloadButton>button:hover {{
+.stButton>button:hover, .stDownloadButton>button:hover{{
   transform: translateY(-1px);
-  filter: brightness(1.04);
+  filter: brightness(1.05);
 }}
-.stButton>button:active, .stDownloadButton>button:active {{
-  transform: translateY(0px) scale(.99);
-}}
-.stButton>button[kind="primary"] {{
-  border: none !important;
-  background: linear-gradient(180deg, rgba(88,204,2,1), rgba(40,160,0,1)) !important;
-  color: #07110a !important;
-  box-shadow: 0 16px 34px rgba(88,204,2,.20);
+.stButton>button:active, .stDownloadButton>button:active{{
+  transform: translateY(2px);
+  box-shadow:
+    0 3px 0 rgba(0,0,0,.22),
+    0 10px 18px rgba(0,0,0,.16) !important;
 }}
 
-/* Tabs-as-nav (Streamlit radio) — ONLY for desktop navbar */
-div[data-testid="stRadio"] > div{{
+/* Primary CTA */
+.stButton>button[kind="primary"]{{
+  background: linear-gradient(180deg, rgba(88,204,2,1), rgba(58,184,0,1)) !important;
+  color: #07110a !important;
+  border: 2px solid rgba(255,255,255,.12) !important;
+  box-shadow:
+    0 6px 0 rgba(0,0,0,.28),
+    0 18px 34px rgba(88,204,2,.18) !important;
+}}
+.stButton>button[kind="primary"]:active{{
+  box-shadow:
+    0 3px 0 rgba(0,0,0,.28),
+    0 12px 22px rgba(88,204,2,.16) !important;
+}}
+
+/* Compact buttons (used in per-card action bars) */
+.card-action-row .stButton > button{{
+  padding: 0.35rem 0.70rem !important;
+  font-size: 0.86rem !important;
+  min-height: 38px !important;
+  border-radius: 14px !important;
+  box-shadow:
+    0 5px 0 rgba(0,0,0,.22),
+    0 12px 18px rgba(0,0,0,.16) !important;
+}}
+
+
+/* Tabs */
+div[data-testid="stTabs"] [data-baseweb="tab-list"] {{
+  gap: 8px;
+  padding: 6px 8px;
+  background: linear-gradient(180deg, var(--surface), var(--surface2));
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  box-shadow: var(--sh2);
+}}
+div[data-testid="stTabs"] [data-baseweb="tab"] {{
+  border-radius: 999px !important;
+  padding: 10px 14px !important;
+  font-weight: 950 !important;
+  color: var(--mut) !important;
+}}
+div[data-testid="stTabs"] [aria-selected="true"] {{
+  background: linear-gradient(180deg, rgba(28,176,246,.20), rgba(88,204,2,.14)) !important;
+  color: var(--txt) !important;
+}}
+
+/* Sticky action footer */
+.sticky-bottom {{
+  position: sticky;
+  bottom: 0;
+  z-index: 50;
+  padding-top: 10px;
+  padding-bottom: 10px;
+  background: linear-gradient(180deg, rgba(0,0,0,0), var(--bg2) 35%);
+}}
+
+/* Desktop segmented nav (radio) */
+div[data-testid="stRadio"] > div {{
   background: linear-gradient(180deg, var(--surface), var(--surface2));
   border: 1px solid var(--line);
   border-radius: 30px;
@@ -289,25 +360,7 @@ div[data-testid="stRadio"] > div{{
   box-shadow: var(--sh2);
 }}
 
-
-
-
-/* Mobile: ONLY hamburger */
-@media (max-width: 760px){{
-  .desktop-nav-wrap{{ display:none !important; }}
-}}
-
-/* Desktop: ONLY navbar (hide hamburger) */
-@media (min-width: 761px){{
-  }}
-
-/* Hamburger list items (more list-like) */
-
-/* --- Nav: remove radio circle + selected dot ---
-   Streamlit/BaseWeb renders a circular control inside each label.
-   We keep the label clickable, but hide that control so navigation
-   happens with a single click on the icon/text only.
-*/
+/* Remove radio circle + dot */
 div[data-testid="stRadio"] input[type="radio"] {{
   position: absolute !important;
   opacity: 0 !important;
@@ -315,9 +368,7 @@ div[data-testid="stRadio"] input[type="radio"] {{
   height: 0 !important;
   pointer-events: none !important;
 }}
-div[data-testid="stRadio"] label > div:first-child {{
-  display: none !important;  /* the circle + dot wrapper */
-}}
+div[data-testid="stRadio"] label > div:first-child {{ display: none !important; }}
 div[data-testid="stRadio"] label {{
   background: transparent;
   border-radius: 999px;
@@ -332,203 +383,65 @@ div[data-testid="stRadio"] label:hover {{
   background: rgba(28,176,246,.10);
   color: var(--txt);
 }}
-/* best-effort "active" look (BaseWeb markup changes sometimes) */
 div[data-testid="stRadio"] label:has(input:checked) {{
   background: linear-gradient(180deg, rgba(28,176,246,.20), rgba(88,204,2,.14));
   color: var(--txt);
   box-shadow: 0 10px 22px rgba(0,0,0,.10);
 }}
+div[data-testid="stRadio"] label * {{ color: inherit !important; }}
 
-
-/* ---------- Fix light-mode unreadable text (metrics + some widgets/nav) ---------- */
-
-/* Widget labels: be aggressive (Streamlit DOM differs by widget) */
-[data-testid="stWidgetLabel"], 
-[data-testid="stWidgetLabel"] * {{
-  color: var(--mut) !important;
-  font-weight: 850 !important;
+/* Cards page: bordered container "tiles" */
+div[data-testid="stVerticalBlockBorderWrapper"] {{
+  border-radius: 16px !important;
+  overflow: hidden !important;
+  border: 1px solid rgba(255,255,255,0.12) !important;
+  box-shadow: 0 12px 34px rgba(0,0,0,0.30), inset 0 1px 0 rgba(255,255,255,0.06) !important;
+  transition: transform 160ms ease, box-shadow 160ms ease, border-color 160ms ease, filter 160ms ease !important;
+  background: transparent !important;
+}}
+div[data-testid="stVerticalBlockBorderWrapper"] > div {{
+  background:
+    radial-gradient(520px 240px at 18% 18%, rgba(28,176,246,0.16), transparent 60%),
+    radial-gradient(520px 240px at 86% 86%, rgba(88,204,2,0.12), transparent 62%),
+    linear-gradient(180deg, rgba(255,255,255,0.10), rgba(255,255,255,0.05)) !important;
+  padding: 16px 16px 14px 16px !important;
+}}
+div[data-testid="stVerticalBlockBorderWrapper"]:hover {{
+  transform: translateY(-3px) !important;
+  border-color: rgba(255,255,255,0.20) !important;
+  box-shadow: 0 16px 44px rgba(0,0,0,0.36), 0 0 0 1px rgba(255,255,255,0.04), inset 0 1px 0 rgba(255,255,255,0.07) !important;
+}}
+div[data-testid="stVerticalBlockBorderWrapper"]:hover > div {{
+  filter: brightness(1.06) !important;
 }}
 
-/* Metrics (st.metric): label/value/delta colors */
-div[data-testid="stMetric"] {{
-  color: var(--txt) !important;
-}}
-div[data-testid="stMetric"] [data-testid="stMetricLabel"],
-div[data-testid="stMetric"] [data-testid="stMetricLabel"] * {{
-  color: var(--mut) !important;
-  font-weight: 900 !important;
-}}
-div[data-testid="stMetric"] [data-testid="stMetricValue"],
-div[data-testid="stMetric"] [data-testid="stMetricValue"] * {{
-  color: var(--txt) !important;
-  font-weight: 1000 !important;
-}}
-div[data-testid="stMetric"] [data-testid="stMetricDelta"],
-div[data-testid="stMetric"] [data-testid="stMetricDelta"] * {{
-  color: var(--mut) !important;
-}}
+a {{ color: var(--brand2); }}
 
-/* Nav (radio): ensure the visible text inherits our color (sometimes stays white in light mode) */
-div[data-testid="stRadio"] label * {{
-  color: inherit !important;
-}}
-
-/* Reduce yellow-ish selection artifacts in some themes */
-div[data-testid="stAppViewContainer"] a {{
-  color: var(--brand2);
-}}
-
-.small {{
+/* === Horizontal control rows: align mixed widgets (buttons/inputs/selects) === */
+.ctl-label {{
+  height: 18px;            /* reserve a consistent label slot */
+  margin-bottom: 6px;
+  display: flex;
+  align-items: flex-end;
+  font-weight: 950;
   font-size: 13px;
   color: var(--mut);
 }}
+
+/* Card action buttons: compact sizing */
+.card-action-row .stButton > button {{
+  padding: 0.18rem 0.55rem !important;
+  font-size: 0.82rem !important;
+  line-height: 1.05 !important;
+  min-height: 32px !important;
+  border-radius: 999px !important;
+}}
+.card-action-row .stButton {{margin: 0 !important; }}
+.card-action-row [data-testid="column"] {{ padding-left: 0 !important; padding-right: 0 !important; }}
+
 </style>
 """
     st.markdown(textwrap.dedent(css).lstrip(), unsafe_allow_html=True)
-
-
-def badge_row(items: List[Tuple[str, str]]) -> None:
-    chips = " ".join([f"<span class='chip'>{icon} <b>{label}</b></span>" for icon, label in items])
-    st.markdown(chips, unsafe_allow_html=True)
-
-
-def select_card(card_id: int) -> None:
-    st.session_state.selected_card_id = int(card_id)
-
-
-def render_selected_card_viewer(title: str = "Selected card") -> None:
-    """Render the selected card using the same flip-card UI as the review queue."""
-    cid = st.session_state.get("selected_card_id")
-    if not cid:
-        return
-    card = fetch_card_by_id(int(cid))
-    if not card:
-        st.session_state.selected_card_id = None
-        return
-
-    topL, topR = st.columns([6, 1])
-    with topL:
-        st.markdown(f"### {title} • #{card['id']}")
-        st.caption(
-            f"lang: {card.get('language','')} • created: {card.get('created_at','—')[:19]} • due: {card.get('due_date','—')}"
-        )
-        if card.get("tags"):
-            st.markdown(f"<span class='chip'>🏷️ <b>{card['tags']}</b></span>", unsafe_allow_html=True)
-    with topR:
-        st.write("")
-        if st.button("Close", key=f"close_card_{card['id']}_viewer"):
-            st.session_state.selected_card_id = None
-            st.rerun()
-
-    meta_left = f"#{card['id']} • {card.get('language','fr')}"
-    meta_right = f"due {card.get('due_date','—')}"
-    render_flashcard_html(
-        front=card.get("front", "") or "",
-        back=card.get("back", "") or "",
-        meta_left=meta_left,
-        meta_right=meta_right,
-        height=360,
-        theme=st.session_state.get("theme", "Light"),
-    )
-
-    extra = []
-    if (card.get("example") or "").strip():
-        extra.append(("Example", card.get("example", "")))
-    if (card.get("notes") or "").strip():
-        extra.append(("Notes", card.get("notes", "")))
-
-    if extra:
-        with st.expander("More", expanded=False):
-            for k, v in extra:
-                st.markdown(f"**{k}**")
-                st.write(v)
-
-    st.markdown("</div>", unsafe_allow_html=True)
-
-
-def stat_pill(icon: str, label: str, value: str) -> str:
-    return f"<span class='chip'>{icon} <b>{label}</b> {value}</span>"
-
-
-def app_header() -> None:
-    carrots, croissants, toward = carrots_and_croissants()
-    xp = carrots
-    streak = int(st.session_state.get("streak", 1))
-    level, _, _ = level_from_xp(xp)
-    total_cards = len(fetch_cards())
-
-    html = f"""
-<div class="card" style="padding:16px 18px; margin-bottom:12px;">
-  <div class="card-header">
-    <div>
-      <div style="display:flex; align-items:center; gap:10px;">
-        <div>
-          <div style="font-weight:1000; font-size:22px; letter-spacing:.2px;">Charlot</div>
-          <div class="h-sub">Dictionary • Flashcards • Notes </div>
-        </div>
-      </div>
-    </div>
-    <div style="display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end;">
-      {stat_pill("🔥","Streak", str(streak))}
-      {stat_pill("🥕","XP", str(carrots))}
-      {stat_pill("🥐","Level", str(level))}
-      {stat_pill("🗂️","Cards", str(total_cards))}
-    </div>
-  </div>
-</div>
-"""
-    st.markdown(textwrap.dedent(html).lstrip(), unsafe_allow_html=True)
-
-
-def top_nav() -> str:
-    pages = [
-        ("🏠", "Home"),
-        ("📚", "Dictionary"),
-        ("🧠", "Review"),
-        ("🗂️", "Cards"),
-        ("📝", "Notebook"),
-        ("🔁", "Import/Export"),
-        ("⚙️", "Settings"),
-        ("❓", "About"),
-    ]
-
-    cur = st.session_state.get("nav", "Home")
-    page_names = [name for _, name in pages]
-    page_labels = [f"{ic} {name}" for ic, name in pages]
-    name_to_label = {name: f"{ic} {name}" for ic, name in pages}
-    label_to_name = {f"{ic} {name}": name for ic, name in pages}
-
-    bp = detect_breakpoint(760)  # "m" or "d"
-
-    if bp == "m":
-        # Mobile: hamburger only (use selectbox to avoid "radio panel" styling)
-        with st.expander("☰ Menu", expanded=False):
-            idx = page_names.index(cur) if cur in page_names else 0
-            pick = st.selectbox(
-                "Menu",
-                page_labels,
-                index=idx,
-                label_visibility="collapsed",
-                key="nav_mobile_select",
-            )
-            st.session_state.nav = label_to_name[pick]
-    else:
-        # Desktop: horizontal nav bar only
-        idx = page_names.index(cur) if cur in page_names else 0
-        pick = st.radio(
-            "Navigation",
-            page_labels,
-            index=idx,
-            horizontal=True,
-            label_visibility="collapsed",
-            key="nav_desktop_radio",
-        )
-        st.session_state.nav = label_to_name[pick]
-
-    return st.session_state.nav
-
-
-
 
 # =========================
 # Utils
@@ -536,26 +449,85 @@ def top_nav() -> str:
 def today_utc_date() -> date:
     return datetime.utcnow().date()
 
-
 def iso_date(d: date) -> str:
     return d.isoformat()
-
 
 def clamp_int(x: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, int(x)))
 
-
 def norm_text(s: str) -> str:
     return (s or "").strip()
-
 
 def norm_word(s: str) -> str:
     return (s or "").strip().lower()
 
-
 def safe_json(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, indent=2)
 
+def toast(msg: str, icon: str = "✅") -> None:
+    # st.toast exists in newer Streamlit; fallback to st.success.
+    fn = getattr(st, "toast", None)
+    if callable(fn):
+        fn(msg, icon=icon)
+    else:
+        st.success(msg)
+
+# =========================
+# Gamification
+# =========================
+def level_from_xp(xp: int) -> Tuple[int, int, int]:
+    xp = max(0, int(xp))
+    level = xp // 10
+    xp_in_level = xp % 10
+    xp_need = 10
+    return level, xp_in_level, xp_need
+
+
+def copy_to_clipboard_button(text: str, label: str = "Copy text") -> None:
+    """
+    Renders a small button that copies `text` to clipboard (browser-side).
+    """
+    safe = (text or "").replace("\\", "\\\\").replace("`", "\\`")
+    b64 = base64.b64encode((text or "").encode("utf-8")).decode("utf-8")
+    components.html(
+        f"""
+<div style="display:flex; gap:10px; align-items:center; margin-top:6px;">
+  <button id="copyBtn" style="
+    padding:8px 12px; border-radius:12px; border:1px solid var(--line);
+    background: var(--surface); color: var(--txt); cursor:pointer;">
+    {label}
+  </button>
+  <span id="copyMsg" style="color: var(--mut); font-size: 13px;"></span>
+</div>
+<script>
+(function() {{
+  const btn = document.getElementById("copyBtn");
+  const msg = document.getElementById("copyMsg");
+  btn.onclick = async () => {{
+    try {{
+      const txt = atob("{b64}");
+      await navigator.clipboard.writeText(txt);
+      msg.textContent = "Copied ✓";
+      setTimeout(()=>msg.textContent="", 1200);
+    }} catch(e) {{
+      msg.textContent = "Copy failed (browser blocked)";
+      setTimeout(()=>msg.textContent="", 1800);
+    }}
+  }};
+}})();
+</script>
+""",
+        height=55,
+    )
+
+
+
+def carrots_and_croissants() -> Tuple[int, int, int]:
+    carrots = int(st.session_state.get("xp", 0) or 0)
+    carrots = max(0, carrots)
+    croissants = carrots // 10
+    toward = carrots % 10
+    return carrots, croissants, toward
 
 def bump_xp(amount: int) -> None:
     amount = int(amount)
@@ -580,7 +552,6 @@ def bump_xp(amount: int) -> None:
     st.session_state.last_xp_date = today
     st.session_state.xp = int(st.session_state.get("xp", 0)) + amount
 
-    # Persist (so XP/carrots doesn't reset on rerun)
     try:
         set_user_state(
             xp=int(st.session_state.get("xp", 0) or 0),
@@ -588,115 +559,7 @@ def bump_xp(amount: int) -> None:
             last_xp_date=str(st.session_state.get("last_xp_date") or today),
         )
     except Exception:
-        # Never break UI because of a persistence failure.
         pass
-
-
-
-
-def count_cards_db() -> int:
-    """Return total number of cards in DB (fast COUNT(*)).
-
-    Used to ensure carrots (XP) reflect cards already created, even if the user
-    created them before we implemented carrot persistence.
-    """
-    try:
-        conn = db()
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM cards;")
-        n = cur.fetchone()[0]
-        conn.close()
-        return int(n or 0)
-    except Exception:
-        try:
-            conn.close()
-        except Exception:
-            pass
-        return 0
-
-
-def reconcile_carrots_with_cards() -> None:
-    """Ensure carrots (XP) is at least the number of cards ever created.
-
-    Rule: creating a card grants +1 🥕 carrot. Deleting a card should NOT remove
-    already-earned carrots, so we only *increase* XP when needed.
-    """
-    try:
-        total_cards = count_cards_db()
-        cur_xp = int(st.session_state.get("xp", 0) or 0)
-
-        if total_cards > cur_xp:
-            st.session_state.xp = total_cards
-            # Keep streak/last date sane for persistence
-            today = iso_date(today_utc_date())
-            if "streak" not in st.session_state:
-                st.session_state.streak = 1
-            if "last_xp_date" not in st.session_state:
-                st.session_state.last_xp_date = today
-
-            # Persist so it stays correct on rerun
-            set_user_state(
-                xp=int(st.session_state.get("xp", 0) or 0),
-                streak=int(st.session_state.get("streak", 1) or 1),
-                last_xp_date=str(st.session_state.get("last_xp_date") or today),
-            )
-    except Exception:
-        # Never break UI because of a reconciliation/persistence issue.
-        pass
-
-def level_from_xp(xp: int) -> Tuple[int, int, int]:
-    """Leveling based on carrots (XP).
-
-    - XP is the total number of 🥕 carrots collected.
-    - Level is the number of 🥐 croissants earned.
-    - Every 10 carrots => +1 croissant (level up).
-    Returns: (level, xp_in_level, xp_need)
-    where xp_need is always 10.
-    """
-    xp = max(0, int(xp))
-    level = xp // 10
-    xp_in_level = xp % 10
-    xp_need = 10
-    return level, xp_in_level, xp_need
-
-
-
-def carrots_and_croissants() -> Tuple[int, int, int]:
-    """Return (carrots_total, croissants, carrots_toward_next_croissant)."""
-    carrots = int(st.session_state.get("xp", 0) or 0)
-    carrots = max(0, carrots)
-    croissants = carrots // 10
-    toward = carrots % 10
-    return carrots, croissants, toward
-
-
-def difficulty_bucket(card_row: Dict[str, Any]) -> str:
-    """Bucket cards into: new, difficult, meh, easy.
-
-    We use the *last submitted grade* (quality) for bucketing:
-
-    - new: never graded OR last_quality missing
-    - difficult: last_quality in {4, 5}
-    - meh: last_quality == 3
-    - easy: last_quality in {1, 2}
-
-    (If some older data contains 0, it is treated as difficult.)
-    """
-    q = card_row.get("last_quality", None)
-    if q is None:
-        return "new"
-    try:
-        q = int(q)
-    except Exception:
-        return "new"
-    if q <= 0:
-        return "difficult"
-    if q >= 4:
-        return "difficult"
-    if q == 3:
-        return "meh"
-    return "easy"
-
 
 # =========================
 # DB Layer
@@ -707,10 +570,106 @@ def db() -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys=ON;")
     return conn
 
+def init_db() -> None:
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS cards (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            language TEXT NOT NULL DEFAULT 'fr',
+            front TEXT NOT NULL,
+            back TEXT NOT NULL,
+            tags TEXT NOT NULL DEFAULT '',
+            example TEXT NOT NULL DEFAULT '',
+            notes TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS reviews (
+            card_id INTEGER PRIMARY KEY,
+            due_date TEXT NOT NULL,
+            interval_days INTEGER NOT NULL DEFAULT 0,
+            repetitions INTEGER NOT NULL DEFAULT 0,
+            ease REAL NOT NULL DEFAULT 2.5,
+            last_reviewed_at TEXT,
+            last_quality INTEGER,
+            FOREIGN KEY(card_id) REFERENCES cards(id) ON DELETE CASCADE
+        );
+        """
+    )
+
+    # Migration safety (older DB)
+    try:
+        cur.execute("PRAGMA table_info(reviews);")
+        cols = [r[1] for r in cur.fetchall()]
+        if "last_quality" not in cols:
+            cur.execute("ALTER TABLE reviews ADD COLUMN last_quality INTEGER;")
+    except Exception:
+        pass
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            xp INTEGER NOT NULL DEFAULT 0,
+            streak INTEGER NOT NULL DEFAULT 1,
+            last_xp_date TEXT NOT NULL
+        );
+        """
+    )
+    cur.execute("SELECT id FROM user_state WHERE id = 1;")
+    if cur.fetchone() is None:
+        cur.execute(
+            "INSERT INTO user_state(id, xp, streak, last_xp_date) VALUES(1, 0, 1, ?);",
+            (iso_date(today_utc_date()),),
+        )
+
+    
+    # =========================
+
+
+    # =========================
+    # Notebook PDF + Vocab
+    # =========================
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pdf_books (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            data BLOB NOT NULL,
+            uploaded_at TEXT NOT NULL
+        );
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pdf_vocab (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            book_id INTEGER NOT NULL,
+            word TEXT NOT NULL,
+            meaning TEXT NOT NULL DEFAULT '',
+            context TEXT NOT NULL DEFAULT '',
+            page INTEGER,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(book_id) REFERENCES pdf_books(id) ON DELETE CASCADE
+        );
+        """
+    )
+
+    conn.commit()
+    conn.close()
+
 
 
 def get_user_state() -> Dict[str, Any]:
-    """Load persistent user state from DB (singleton row id=1)."""
     conn = db()
     cur = conn.cursor()
     cur.execute("SELECT xp, streak, last_xp_date FROM user_state WHERE id=1;")
@@ -721,15 +680,12 @@ def get_user_state() -> Dict[str, Any]:
     xp, streak, last_xp_date = row
     return {"xp": int(xp or 0), "streak": int(streak or 1), "last_xp_date": str(last_xp_date or iso_date(today_utc_date()))}
 
-
 def set_user_state(xp: int, streak: int, last_xp_date: str) -> None:
-    """Persist user state to DB (robust against transient 'database is locked')."""
     xp_i = int(xp)
     streak_i = int(streak)
     last_s = str(last_xp_date)
 
-    # Try a couple times in case another connection briefly holds the write lock.
-    last_err: Exception | None = None
+    last_err: Optional[Exception] = None
     for _ in range(3):
         try:
             conn = db()
@@ -753,20 +709,12 @@ def set_user_state(xp: int, streak: int, last_xp_date: str) -> None:
                 conn.close()
             except Exception:
                 pass
-            # small backoff
             import time as _time
             _time.sleep(0.05)
-
     if last_err:
         raise last_err
 
-
 def sync_session_from_db() -> None:
-    """One-way sync: DB -> session_state (call once at startup).
-
-    We avoid overwriting in-memory progress with older DB values (e.g. if a write
-    was temporarily locked during the previous run).
-    """
     s = get_user_state()
     db_xp = int(s.get("xp", 0) or 0)
     db_streak = int(s.get("streak", 1) or 1)
@@ -781,77 +729,38 @@ def sync_session_from_db() -> None:
         st.session_state.streak = db_streak
     st.session_state.last_xp_date = db_last
 
-
-def init_db() -> None:
-    conn = db()
-    cur = conn.cursor()
-
-    # Cards
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS cards (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            language TEXT NOT NULL DEFAULT 'fr',
-            front TEXT NOT NULL,
-            back TEXT NOT NULL,
-            tags TEXT NOT NULL DEFAULT '',
-            example TEXT NOT NULL DEFAULT '',
-            notes TEXT NOT NULL DEFAULT '',
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        """
-    )
-
-    # Reviews (SM-2 metadata + last_quality for difficulty buckets)
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS reviews (
-            card_id INTEGER PRIMARY KEY,
-            due_date TEXT NOT NULL,
-            interval_days INTEGER NOT NULL DEFAULT 0,
-            repetitions INTEGER NOT NULL DEFAULT 0,
-            ease REAL NOT NULL DEFAULT 2.5,
-            last_reviewed_at TEXT,
-            last_quality INTEGER,
-            FOREIGN KEY(card_id) REFERENCES cards(id) ON DELETE CASCADE
-        );
-        """
-    )
-
-    # --- lightweight migration: add last_quality to reviews (existing DBs) ---
+def count_cards_db() -> int:
     try:
-        cur.execute("PRAGMA table_info(reviews);")
-        cols = [r[1] for r in cur.fetchall()]
-        if "last_quality" not in cols:
-            cur.execute("ALTER TABLE reviews ADD COLUMN last_quality INTEGER;")
+        conn = db()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM cards;")
+        n = cur.fetchone()[0]
+        conn.close()
+        return int(n or 0)
     except Exception:
-        # If anything goes wrong here, we don't want to break app startup.
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return 0
+
+def reconcile_carrots_with_cards() -> None:
+    """Ensure carrots (XP) is at least the number of cards ever created."""
+    try:
+        total_cards = count_cards_db()
+        cur_xp = int(st.session_state.get("xp", 0) or 0)
+        if total_cards > cur_xp:
+            st.session_state.xp = total_cards
+            today = iso_date(today_utc_date())
+            st.session_state.setdefault("streak", 1)
+            st.session_state.setdefault("last_xp_date", today)
+            set_user_state(
+                xp=int(st.session_state.get("xp", 0) or 0),
+                streak=int(st.session_state.get("streak", 1) or 1),
+                last_xp_date=str(st.session_state.get("last_xp_date") or today),
+            )
+    except Exception:
         pass
-
-    
-    # User state (persistent carrots/XP + streak)
-    cur.execute(
-        '''
-        CREATE TABLE IF NOT EXISTS user_state (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            xp INTEGER NOT NULL DEFAULT 0,
-            streak INTEGER NOT NULL DEFAULT 1,
-            last_xp_date TEXT NOT NULL
-        );
-        '''
-    )
-    # Ensure singleton row exists
-    cur.execute("SELECT id FROM user_state WHERE id = 1;")
-    if cur.fetchone() is None:
-        cur.execute(
-            "INSERT INTO user_state(id, xp, streak, last_xp_date) VALUES(1, 0, 1, ?);",
-            (iso_date(today_utc_date()),),
-        )
-
-    conn.commit()
-    conn.close()
-
 
 def upsert_review_defaults(card_id: int) -> None:
     conn = db()
@@ -869,7 +778,6 @@ def upsert_review_defaults(card_id: int) -> None:
     conn.commit()
     conn.close()
 
-
 def create_card(language: str, front: str, back: str, tags: str, example: str, notes: str) -> int:
     now = datetime.utcnow().isoformat(timespec="seconds")
     conn = db()
@@ -879,14 +787,14 @@ def create_card(language: str, front: str, back: str, tags: str, example: str, n
         INSERT INTO cards(language, front, back, tags, example, notes, created_at, updated_at)
         VALUES(?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (norm_text(language), norm_text(front), norm_text(back), norm_text(tags), norm_text(example), norm_text(notes), now, now),
+        (norm_text(language), norm_text(front), norm_text(back), norm_text(tags),
+         norm_text(example), norm_text(notes), now, now),
     )
     card_id = int(cur.lastrowid)
     conn.commit()
     conn.close()
     upsert_review_defaults(card_id)
     return card_id
-
 
 def update_card(card_id: int, language: str, front: str, back: str, tags: str, example: str, notes: str) -> None:
     now = datetime.utcnow().isoformat(timespec="seconds")
@@ -897,12 +805,12 @@ def update_card(card_id: int, language: str, front: str, back: str, tags: str, e
         SET language=?, front=?, back=?, tags=?, example=?, notes=?, updated_at=?
         WHERE id=?
         """,
-        (norm_text(language), norm_text(front), norm_text(back), norm_text(tags), norm_text(example), norm_text(notes), now, card_id),
+        (norm_text(language), norm_text(front), norm_text(back), norm_text(tags),
+         norm_text(example), norm_text(notes), now, card_id),
     )
     conn.commit()
     conn.close()
     upsert_review_defaults(card_id)
-
 
 def delete_card(card_id: int) -> None:
     conn = db()
@@ -910,11 +818,17 @@ def delete_card(card_id: int) -> None:
     conn.commit()
     conn.close()
 
+def fetch_cards(filter_text: str = "", tag: str = "", order_by: str = "updated_desc") -> List[Dict[str, Any]]:
+    """Fetch cards with optional free-text filter, tag filter, and stable ordering.
 
-def fetch_cards(filter_text: str = "", tag: str = "") -> List[Dict[str, Any]]:
+    order_by:
+      - updated_desc (default)
+      - due_asc
+      - created_desc
+      - front_asc
+    """
     conn = db()
     cur = conn.cursor()
-
     q = """
     SELECT c.id, c.language, c.front, c.back, c.tags, c.example, c.notes, c.created_at, c.updated_at,
            r.due_date, r.interval_days, r.repetitions, r.ease, r.last_quality, r.last_reviewed_at
@@ -923,37 +837,43 @@ def fetch_cards(filter_text: str = "", tag: str = "") -> List[Dict[str, Any]]:
     WHERE 1=1
     """
     params: List[Any] = []
-
     if norm_text(filter_text):
         q += " AND (c.front LIKE ? OR c.back LIKE ? OR c.example LIKE ? OR c.notes LIKE ?)"
         like = f"%{norm_text(filter_text)}%"
         params.extend([like, like, like, like])
-
     if norm_text(tag):
         q += " AND (',' || REPLACE(c.tags,' ', '') || ',') LIKE ?"
         params.append(f"%,{norm_text(tag).replace(' ', '')},%")
 
-    q += " ORDER BY c.updated_at DESC"
-    cur.execute(q, params)
+    order_sql = {
+        "updated_desc": "c.updated_at DESC, c.id DESC",
+        "created_desc": "c.created_at DESC, c.id DESC",
+        "due_asc": "date(COALESCE(r.due_date, c.created_at)) ASC, c.id ASC",
+        "front_asc": "LOWER(c.front) ASC, c.id ASC",
+    }.get(norm_word(order_by), "c.updated_at DESC, c.id DESC")
 
+    q += f" ORDER BY {order_sql}"
+    cur.execute(q, params)
     cols = [d[0] for d in cur.description]
     rows = [dict(zip(cols, r)) for r in cur.fetchall()]
     conn.close()
     return rows
 
 
-def fetch_card_by_id(card_id: int) -> Dict[str, Any] | None:
+def fetch_card_by_id(card_id: int) -> Optional[Dict[str, Any]]:
     conn = db()
     cur = conn.cursor()
-    q = """
-    SELECT c.id, c.language, c.front, c.back, c.tags, c.example, c.notes, c.created_at, c.updated_at,
-           r.due_date, r.interval_days, r.repetitions, r.ease, r.last_quality, r.last_reviewed_at
-    FROM cards c
-    LEFT JOIN reviews r ON r.card_id = c.id
-    WHERE c.id = ?
-    LIMIT 1
-    """
-    cur.execute(q, (card_id,))
+    cur.execute(
+        """
+        SELECT c.id, c.language, c.front, c.back, c.tags, c.example, c.notes, c.created_at, c.updated_at,
+               r.due_date, r.interval_days, r.repetitions, r.ease, r.last_quality, r.last_reviewed_at
+        FROM cards c
+        LEFT JOIN reviews r ON r.card_id = c.id
+        WHERE c.id = ?
+        LIMIT 1
+        """,
+        (card_id,),
+    )
     row = cur.fetchone()
     if not row:
         conn.close()
@@ -962,25 +882,24 @@ def fetch_card_by_id(card_id: int) -> Dict[str, Any] | None:
     conn.close()
     return dict(zip(cols, row))
 
-
 def fetch_cards_created_on(d: date) -> List[Dict[str, Any]]:
-    """Cards whose created_at date equals the selected date (created_at stored as ISO string)."""
     conn = db()
     cur = conn.cursor()
-    q = """
-    SELECT c.id, c.language, c.front, c.back, c.tags, c.example, c.notes, c.created_at, c.updated_at,
-           r.due_date, r.interval_days, r.repetitions, r.ease, r.last_quality, r.last_reviewed_at
-    FROM cards c
-    LEFT JOIN reviews r ON r.card_id = c.id
-    WHERE substr(c.created_at, 1, 10) = ?
-    ORDER BY c.created_at DESC
-    """
-    cur.execute(q, (d.isoformat(),))
+    cur.execute(
+        """
+        SELECT c.id, c.language, c.front, c.back, c.tags, c.example, c.notes, c.created_at, c.updated_at,
+               r.due_date, r.interval_days, r.repetitions, r.ease, r.last_quality, r.last_reviewed_at
+        FROM cards c
+        LEFT JOIN reviews r ON r.card_id = c.id
+        WHERE substr(c.created_at, 1, 10) = ?
+        ORDER BY c.created_at DESC
+        """,
+        (d.isoformat(),),
+    )
     cols = [d[0] for d in cur.description]
     rows = [dict(zip(cols, r)) for r in cur.fetchall()]
     conn.close()
     return rows
-
 
 def fetch_due_cards(on_date: date) -> List[Dict[str, Any]]:
     conn = db()
@@ -988,7 +907,7 @@ def fetch_due_cards(on_date: date) -> List[Dict[str, Any]]:
     cur.execute(
         """
         SELECT c.id, c.language, c.front, c.back, c.tags, c.example, c.notes,
-               r.due_date, r.interval_days, r.repetitions, r.ease
+               r.due_date, r.interval_days, r.repetitions, r.ease, r.last_quality, r.last_reviewed_at
         FROM cards c
         JOIN reviews r ON r.card_id = c.id
         WHERE date(r.due_date) <= date(?)
@@ -1001,8 +920,7 @@ def fetch_due_cards(on_date: date) -> List[Dict[str, Any]]:
     conn.close()
     return rows
 
-
-def update_review_state(card_id: int, due_date: date, interval_days: int, repetitions: int, ease: float, last_quality: int = None) -> None:
+def update_review_state(card_id: int, due_date: date, interval_days: int, repetitions: int, ease: float, last_quality: Optional[int] = None) -> None:
     conn = db()
     conn.execute(
         """
@@ -1010,11 +928,12 @@ def update_review_state(card_id: int, due_date: date, interval_days: int, repeti
         SET due_date=?, interval_days=?, repetitions=?, ease=?, last_quality=?, last_reviewed_at=?
         WHERE card_id=?
         """,
-        (iso_date(due_date), int(interval_days), int(repetitions), float(ease), (None if last_quality is None else int(last_quality)), datetime.utcnow().isoformat(timespec="seconds"), card_id),
+        (iso_date(due_date), int(interval_days), int(repetitions), float(ease),
+         (None if last_quality is None else int(last_quality)),
+         datetime.utcnow().isoformat(timespec="seconds"), card_id),
     )
     conn.commit()
     conn.close()
-
 
 def all_tags() -> List[str]:
     conn = db()
@@ -1029,6 +948,158 @@ def all_tags() -> List[str]:
             if part:
                 tags.add(part)
     return sorted(tags)
+# =========================
+# Notebook PDF helpers
+# =========================
+def pdf_book_upsert(name: str, data: bytes) -> int:
+    """Insert a PDF book. If same name exists, replace its data."""
+    name = norm_text(name) or "book.pdf"
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM pdf_books WHERE name=? LIMIT 1;", (name,))
+    row = cur.fetchone()
+    if row:
+        book_id = int(row[0])
+        cur.execute("UPDATE pdf_books SET data=?, uploaded_at=? WHERE id=?;", (sqlite3.Binary(data), now, book_id))
+    else:
+        cur.execute("INSERT INTO pdf_books(name, data, uploaded_at) VALUES(?,?,?);", (name, sqlite3.Binary(data), now))
+        book_id = int(cur.lastrowid)
+    conn.commit()
+    conn.close()
+    return book_id
+
+def pdf_books_list() -> List[Dict[str, Any]]:
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT id, name, uploaded_at FROM pdf_books ORDER BY uploaded_at DESC, id DESC;")
+    rows = [{"id": int(r[0]), "name": str(r[1]), "uploaded_at": str(r[2])} for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+def pdf_book_get(book_id: int) -> Optional[Dict[str, Any]]:
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT id, name, data, uploaded_at FROM pdf_books WHERE id=? LIMIT 1;", (int(book_id),))
+    r = cur.fetchone()
+    conn.close()
+    if not r:
+        return None
+    return {"id": int(r[0]), "name": str(r[1]), "data": bytes(r[2]), "uploaded_at": str(r[3])}
+
+def pdf_book_delete(book_id: int) -> None:
+    conn = db()
+    conn.execute("DELETE FROM pdf_books WHERE id=?;", (int(book_id),))
+    conn.commit()
+    conn.close()
+
+def pdf_vocab_add(book_id: int, word: str, meaning: str, context: str, page: Optional[int]) -> int:
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    conn = db()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO pdf_vocab(book_id, word, meaning, context, page, created_at) VALUES(?,?,?,?,?,?);",
+        (int(book_id), norm_text(word), norm_text(meaning), norm_text(context), (None if page is None else int(page)), now),
+    )
+    vid = int(cur.lastrowid)
+    conn.commit()
+    conn.close()
+    return vid
+
+def pdf_vocab_list(book_id: int, q: str = "") -> List[Dict[str, Any]]:
+    conn = db()
+    cur = conn.cursor()
+    qn = norm_text(q)
+    sql = "SELECT id, book_id, word, meaning, context, page, created_at FROM pdf_vocab WHERE book_id=?"
+    params: List[Any] = [int(book_id)]
+    if qn:
+        sql += " AND (word LIKE ? OR meaning LIKE ? OR context LIKE ?)"
+        like = f"%{qn}%"
+        params.extend([like, like, like])
+    sql += " ORDER BY created_at DESC, id DESC"
+    cur.execute(sql, params)
+    cols = [d[0] for d in cur.description]
+    rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+def pdf_vocab_delete(vocab_id: int) -> None:
+    conn = db()
+    conn.execute("DELETE FROM pdf_vocab WHERE id=?;", (int(vocab_id),))
+    conn.commit()
+    conn.close()
+
+@st.cache_data(show_spinner=False)
+def render_pdf_page_png(pdf_bytes: bytes, page: int, zoom: int) -> bytes:
+    """Render a PDF page to PNG bytes (server-side) using PyMuPDF."""
+    if fitz is None:
+        return b""
+    p = max(1, int(page)) - 1
+    z = max(50, min(300, int(zoom))) / 100.0
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        p = min(p, max(0, doc.page_count - 1))
+        pg = doc.load_page(p)
+        pix = pg.get_pixmap(matrix=fitz.Matrix(z, z), alpha=False)
+        return pix.tobytes("png")
+    finally:
+        doc.close()
+
+@st.cache_data(show_spinner=False)
+def extract_pdf_page_text(pdf_bytes: bytes, page: int) -> str:
+    """Extract selectable text from one PDF page using PyMuPDF."""
+    if fitz is None:
+        return ""
+    p = max(1, int(page)) - 1
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        p = min(p, max(0, doc.page_count - 1))
+        pg = doc.load_page(p)
+        txt = pg.get_text("text") or ""
+        txt = re.sub(r"\n{3,}", "\n\n", txt).strip()
+        return txt
+    finally:
+        doc.close()
+
+
+@st.cache_data(show_spinner=False)
+def google_translate(text: str, source_lang: str = "fr", target_lang: str = "en") -> str:
+    """Translate text using a lightweight Google Translate endpoint.
+
+    This uses the public "translate_a/single" endpoint (no API key). It may break
+    if Google changes it; the UI also provides a direct link to translate.google.com.
+    """
+    text = (text or "").strip()
+    if not text:
+        return ""
+    sl = norm_word(source_lang) or "auto"
+    tl = norm_word(target_lang) or "en"
+    try:
+        r = requests.get(
+            "https://translate.googleapis.com/translate_a/single",
+            params={
+                "client": "gtx",
+                "sl": sl,
+                "tl": tl,
+                "dt": "t",
+                "q": text,
+            },
+            headers=HTTP_HEADERS,
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return ""
+        data = r.json()
+        # data[0] is a list of translated segments: [["translated","original",...], ...]
+        if not isinstance(data, list) or not data:
+            return ""
+        segs = data[0]
+        if not isinstance(segs, list):
+            return ""
+        out = "".join([(s[0] if isinstance(s, list) and s else "") for s in segs])
+        return (out or "").strip()
+    except Exception:
+        return ""
 
 
 # =========================
@@ -1039,7 +1110,6 @@ def sm2_next(review: Dict[str, Any], quality: int) -> Tuple[int, int, float]:
     reps = int(review.get("repetitions", 0) or 0)
     interval = int(review.get("interval_days", 0) or 0)
     ease = float(review.get("ease", 2.5) or 2.5)
-
     if q < 3:
         reps = 0
         interval = 1
@@ -1052,10 +1122,157 @@ def sm2_next(review: Dict[str, Any], quality: int) -> Tuple[int, int, float]:
         else:
             interval = int(round(interval * ease)) if interval > 0 else int(round(6 * ease))
 
+
+
     ease = ease + (0.1 - (5 - q) * (0.08 + (5 - q) * 0.02))
     ease = max(1.3, ease)
     return interval, reps, ease
 
+
+def pdf_selectable_viewer(pdf_bytes: bytes, page: int = 1, zoom: int = 100, height: int = 820) -> None:
+    """
+    Render a selectable PDF page inside Streamlit using PDF.js (text layer enabled),
+    so the user can highlight/copy text directly from the PDF view.
+
+    Notes:
+    - Works when the PDF actually contains text (not only scanned images).
+    - Uses a JS renderer to avoid Chrome blocking data: PDFs in iframes.
+    """
+    try:
+        b64 = base64.b64encode(pdf_bytes).decode("utf-8")
+    except Exception:
+        st.error("Could not load PDF bytes for preview.")
+        return
+
+    pg = max(1, int(page))
+    zm = max(50, min(300, int(zoom)))
+    h = int(height)
+
+    # PDF.js viewer (single-page) with selectable text layer
+    components.html(
+        f"""
+<div id="pdfjs-root" style="width:100%; height:{h}px; position:relative; border-radius:16px; overflow:hidden; border:1px solid rgba(255,255,255,.10);">
+  <div id="pdfjs-scroll" style="width:100%; height:100%; overflow:auto; background: rgba(0,0,0,.02);">
+    <div id="pdfjs-pagewrap" style="position:relative; margin:16px auto; width:fit-content;">
+      <canvas id="pdfjs-canvas" style="display:block;"></canvas>
+      <div id="pdfjs-textLayer" class="textLayer" style="position:absolute; inset:0;"></div>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script>
+(async () => {{
+  const b64 = "{b64}";
+  const pageNum = {pg};
+  const scale = {zm} / 100.0;
+
+  // Configure worker
+  if (window['pdfjsLib']) {{
+    pdfjsLib.GlobalWorkerOptions.workerSrc =
+      "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+  }} else {{
+    const root = document.getElementById("pdfjs-root");
+    root.innerHTML = "<div style='padding:16px; font-family:system-ui;'>PDF.js failed to load.</div>";
+    return;
+  }}
+
+  // Decode base64 → Uint8Array
+  const raw = atob(b64);
+  const bytes = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+
+  const loadingTask = pdfjsLib.getDocument({{ data: bytes }});
+  const pdf = await loadingTask.promise;
+  const page = await pdf.getPage(pageNum);
+
+  const viewport = page.getViewport({{ scale }});
+  const canvas = document.getElementById("pdfjs-canvas");
+  const ctx = canvas.getContext("2d", {{ alpha: false }});
+
+  // HiDPI / devicePixelRatio handling for crisp rendering AND correct text-layer alignment.
+  const outputScale = window.devicePixelRatio || 1;
+
+  // Set actual pixel buffer size
+  canvas.width = Math.floor(viewport.width * outputScale);
+  canvas.height = Math.floor(viewport.height * outputScale);
+
+  // Set CSS size (layout size in CSS pixels)
+  canvas.style.width = Math.floor(viewport.width) + "px";
+  canvas.style.height = Math.floor(viewport.height) + "px";
+
+  // Scale drawing operations to match CSS pixels
+  ctx.setTransform(outputScale, 0, 0, outputScale, 0, 0);
+
+  // Render page to canvas
+  await page.render({{ canvasContext: ctx, viewport }}).promise;
+
+  // Render selectable text layer
+  const textLayer = document.getElementById("pdfjs-textLayer");
+  textLayer.innerHTML = "";
+  textLayer.style.width = Math.floor(viewport.width) + \"px\";
+  textLayer.style.height = Math.floor(viewport.height) + \"px\";
+
+  const textContent = await page.getTextContent();
+  await pdfjsLib.renderTextLayer({{
+    textContent,
+    container: textLayer,
+    viewport,
+    textDivs: []
+  }}).promise;
+
+}})().catch((err) => {{
+  const root = document.getElementById("pdfjs-root");
+  root.innerHTML = "<div style='padding:16px; font-family:system-ui;'>Could not render PDF page: " + String(err) + "</div>";
+}});
+</script>
+
+<style>
+/* IMPORTANT:
+   - Canvas is the readable page.
+   - TextLayer sits on top for selection/copy.
+   - We hide glyph paint (transparent text), but keep the layer interactive. */
+#pdfjs-canvas {{ pointer-events: none; }}
+
+.textLayer {{
+  opacity: 1;                 /* must be visible for selection in some browsers */
+  line-height: 1.0;
+  transform-origin: 0 0;
+  pointer-events: auto;       /* allow click/drag selection */
+  user-select: text;
+}}
+
+.textLayer span {{
+  position: absolute;
+  white-space: pre;
+  transform-origin: 0% 0%;
+  color: transparent !important;                 /* hide text paint */
+  -webkit-text-fill-color: transparent !important;
+}}
+
+.textLayer ::selection {{
+  background: rgba(88, 204, 2, 0.28);
+}}
+</style>
+        """,
+        height=h,
+    )
+
+def difficulty_bucket(card_row: Dict[str, Any]) -> str:
+    q = card_row.get("last_quality", None)
+    if q is None:
+        return "new"
+    try:
+        q = int(q)
+    except Exception:
+        return "new"
+    if q <= 0:
+        return "difficult"
+    if q >= 4:
+        return "difficult"
+    if q == 3:
+        return "meh"
+    return "easy"
 
 # =========================
 # Dictionary backends
@@ -1066,7 +1283,6 @@ def dictapi_lookup(lang: str, word: str) -> Tuple[bool, Any, int]:
     word = norm_text(word)
     if not lang or not word:
         return False, {"error": "Missing lang or word"}, 0
-
     url = f"{DICTAPI_BASE}/{lang}/{word}"
     try:
         r = requests.get(url, timeout=10)
@@ -1079,7 +1295,6 @@ def dictapi_lookup(lang: str, word: str) -> Tuple[bool, Any, int]:
     except Exception as e:
         return False, {"error": str(e)}, 0
 
-
 def parse_dictapi_payload(payload: Any) -> Dict[str, Any]:
     out = {"phonetics": [], "meanings": []}
     if not isinstance(payload, list) or not payload:
@@ -1087,11 +1302,9 @@ def parse_dictapi_payload(payload: Any) -> Dict[str, Any]:
     entry = payload[0]
     if not isinstance(entry, dict):
         return out
-
     for p in (entry.get("phonetics", []) or []):
         if isinstance(p, dict):
             out["phonetics"].append({"text": p.get("text") or "", "audio": p.get("audio") or ""})
-
     for m in (entry.get("meanings", []) or []):
         if not isinstance(m, dict):
             continue
@@ -1100,16 +1313,10 @@ def parse_dictapi_payload(payload: Any) -> Dict[str, Any]:
             if not isinstance(d, dict):
                 continue
             defs.append(
-                {
-                    "definition": d.get("definition") or "",
-                    "example": d.get("example") or "",
-                    "synonyms": d.get("synonyms") or [],
-                }
+                {"definition": d.get("definition") or "", "example": d.get("example") or "", "synonyms": d.get("synonyms") or []}
             )
         out["meanings"].append({"partOfSpeech": m.get("partOfSpeech") or "", "definitions": defs})
-
     return out
-
 
 @st.cache_data(show_spinner=False)
 def wiktionary_summary(lang: str, word: str) -> Tuple[bool, Dict[str, Any]]:
@@ -1117,11 +1324,9 @@ def wiktionary_summary(lang: str, word: str) -> Tuple[bool, Dict[str, Any]]:
     word = norm_text(word)
     if not lang or not word:
         return False, {"error": "Missing lang or word"}
-
     base = WIKTIONARY_BASE.get(lang, WIKTIONARY_BASE["fr"])
     title_enc = requests.utils.quote(word, safe="")
     url = f"{base}/api/rest_v1/page/summary/{title_enc}"
-
     try:
         r = requests.get(url, headers=HTTP_HEADERS, timeout=12)
         status = r.status_code
@@ -1129,19 +1334,15 @@ def wiktionary_summary(lang: str, word: str) -> Tuple[bool, Dict[str, Any]]:
             j = r.json()
         except Exception:
             return False, {"error": f"Non-JSON response (status={status})", "raw_text": r.text[:2000], "source": url}
-
         if status != 200:
             return False, {"error": f"HTTP {status}", "raw": j, "source": url}
-
         title = j.get("title") or word
         extract = (j.get("extract") or "").strip()
         if not extract:
             return False, {"error": "Empty extract", "raw": j, "source": url}
-
         return True, {"title": title, "extract": extract, "source": url}
     except Exception as e:
         return False, {"error": str(e), "source": url}
-
 
 @st.cache_data(show_spinner=False)
 def wiktionary_extract(lang: str, word: str) -> Tuple[bool, Dict[str, Any]]:
@@ -1149,7 +1350,6 @@ def wiktionary_extract(lang: str, word: str) -> Tuple[bool, Dict[str, Any]]:
     word = norm_text(word)
     if not lang or not word:
         return False, {"error": "Missing lang or word"}
-
     base = WIKTIONARY_BASE.get(lang, WIKTIONARY_BASE["fr"])
     api = f"{base}/w/api.php"
     params = {
@@ -1161,7 +1361,6 @@ def wiktionary_extract(lang: str, word: str) -> Tuple[bool, Dict[str, Any]]:
         "redirects": 1,
         "titles": word,
     }
-
     try:
         r = requests.get(api, params=params, headers=HTTP_HEADERS, timeout=12)
         status = r.status_code
@@ -1169,30 +1368,23 @@ def wiktionary_extract(lang: str, word: str) -> Tuple[bool, Dict[str, Any]]:
             j = r.json()
         except Exception:
             return False, {"error": f"Non-JSON response (status={status})", "raw_text": r.text[:2000], "source": api}
-
         if status != 200:
             return False, {"error": f"HTTP {status}", "raw": j, "source": api}
-
         pages = (j.get("query", {}) or {}).get("pages", {}) or {}
         if not pages:
             return False, {"error": "No pages in response", "raw": j, "source": api}
-
         page = next(iter(pages.values()))
         if not isinstance(page, dict):
             return False, {"error": "Bad page format", "raw": j, "source": api}
-
         if "missing" in page:
             return False, {"error": "Not found", "raw": page, "source": api}
-
         title = page.get("title") or word
         extract = (page.get("extract") or "").strip()
         if not extract:
             return False, {"error": "Empty extract", "raw": page, "source": api}
-
         return True, {"title": title, "extract": extract, "source": api}
     except Exception as e:
         return False, {"error": str(e), "source": api}
-
 
 def summarize_extract(extract: str, max_lines: int = 18, max_chars: int = 1400) -> str:
     text = (extract or "").strip()
@@ -1203,7 +1395,6 @@ def summarize_extract(extract: str, max_lines: int = 18, max_chars: int = 1400) 
     if len(snippet) > max_chars:
         snippet = snippet[:max_chars].rstrip() + "…"
     return snippet
-
 
 def best_dictionary_result(lang: str, word: str) -> Tuple[str, Dict[str, Any]]:
     lang = norm_word(lang)
@@ -1230,21 +1421,111 @@ def best_dictionary_result(lang: str, word: str) -> Tuple[str, Dict[str, Any]]:
 
     return "none", {"errors": {"wiktionary_summary": data, "wiktionary_extract": data2, "dictapi": {"status": status3, "raw": payload3}}}
 
+# =========================
+# UI helpers
+# =========================
+def chip(icon: str, label: str, value: str) -> str:
+    return f"<span class='chip'>{icon} <b>{label}</b> {value}</span>"
+
+def badge_row(items: List[Tuple[str, str]]) -> None:
+    html = " ".join([f"<span class='chip'>{ic} <b>{txt}</b></span>" for ic, txt in items])
+    st.markdown(html, unsafe_allow_html=True)
 
 
+def app_header(bp: str) -> None:
+    carrots, croissants, toward = carrots_and_croissants()
+    streak = int(st.session_state.get("streak", 1))
+    level, xp_in, xp_need = level_from_xp(carrots)
+    total_cards = count_cards_db()
+    due_today = len(fetch_due_cards(today_utc_date()))
+
+    # Header
+    with st.container():
+        st.markdown(
+            f"""
+<div class="card" style="padding:14px 16px; margin-bottom:10px;">
+  <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;">
+    <div>
+      <div style="font-weight:1000; font-size:22px; letter-spacing:.2px;">Charlot</div>
+      <div class="h-sub">Dictionary • Flashcards • Review • Notes</div>
+    </div>
+    <div style="display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end;">
+      {chip("🔥","Streak", str(streak))}
+      {chip("🥕","XP", str(carrots))}
+      {chip("🥐","Level", str(level))}
+      {chip("📌","Due", str(due_today))}
+      {chip("🗂️","Cards", str(total_cards))}
+    </div>
+  </div>
+</div>
+""",
+            unsafe_allow_html=True,
+        )
+
+
+def render_quick_find_results(query: str) -> None:
+    q = query.strip()
+    cards = fetch_cards(q.replace("tag:", "").strip() if q.startswith("tag:") else q)
+
+    # Special: #id direct open
+    if q.startswith("#"):
+        try:
+            cid = int(q[1:])
+            c = fetch_card_by_id(cid)
+            if c:
+                st.session_state.selected_card_id = cid
+                st.session_state.nav = "Cards"
+                st.rerun()
+        except Exception:
+            pass
+
+    # Tag quick filter
+    if q.lower().startswith("tag:"):
+        tag = q.split(":", 1)[1].strip()
+        cards = fetch_cards("", tag)
+
+    if not cards:
+        st.caption("No matches.")
+        return
+
+    st.caption(f"Matches: {min(len(cards), 8)} / {len(cards)}")
+    for c in cards[:8]:
+        title = (c.get("front") or "").strip() or f"Card #{c['id']}"
+        cols = st.columns([1.0, 3.0, 1.0])
+        with cols[0]:
+            st.markdown(f"<span class='chip'>#{c['id']}</span>", unsafe_allow_html=True)
+        with cols[1]:
+            st.write(title)
+            if c.get("tags"):
+                st.caption(c.get("tags"))
+        with cols[2]:
+            if st.button("Open", key=f"qf_open_{c['id']}", use_container_width=True):
+                st.session_state.selected_card_id = int(c["id"])
+                st.session_state.nav = "Cards"
+                st.rerun()
+
+def top_nav(bp: str) -> str:
+    cur = st.session_state.get("nav", "Home")
+    page_names = [name for _, name in PAGES]
+    page_labels = [f"{ic} {name}" for ic, name in PAGES]
+    label_to_name = {f"{ic} {name}": name for ic, name in PAGES}
+
+    if bp == "m":
+        with st.expander("☰ Menu", expanded=False):
+            idx = page_names.index(cur) if cur in page_names else 0
+            pick = st.selectbox("Menu", page_labels, index=idx, label_visibility="collapsed", key="nav_mobile_select")
+            st.session_state.nav = label_to_name[pick]
+    else:
+        idx = page_names.index(cur) if cur in page_names else 0
+        pick = st.radio("Navigation", page_labels, index=idx, horizontal=True, label_visibility="collapsed", key="nav_desktop_radio")
+        st.session_state.nav = label_to_name[pick]
+    return st.session_state.nav
 
 # =========================
-# Flashcard HTML (iframe-safe)
+# Flashcard renderer
 # =========================
-def render_flashcard_html(
-    front: str,
-    back: str,
-    meta_left: str = "",
-    meta_right: str = "",
-    height: int = 380,
-    theme: str = "Light",
-) -> None:
-    t = THEMES.get(theme, THEMES["Light"])
+def render_flashcard_html(front: str, back: str, meta_left: str = "", meta_right: str = "", height: int = 380, theme: str = "Dark") -> None:
+    t = THEMES.get(theme, THEMES["Dark"])
 
     def esc(s: str) -> str:
         return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -1255,7 +1536,6 @@ def render_flashcard_html(
     meta_left = esc(meta_left)
     meta_right = esc(meta_right)
 
-    # Keep borders/text correct in BOTH modes
     html = f"""<!doctype html>
 <html>
 <head>
@@ -1283,7 +1563,7 @@ def render_flashcard_html(
     to   {{ opacity:1; transform: translateY(0) scale(1); }}
   }}
 
-  .wrap {{ display:flex; justify-content:center; animation: enter .20s ease-out; }}
+  .wrap {{ display:flex; justify-content:center; animation: enter .18s ease-out; }}
   .flip {{
     width: min(860px, 100%);
     height: 320px;
@@ -1408,10 +1688,94 @@ def render_flashcard_html(
 </html>"""
     components.html(html, height=height, scrolling=False)
 
+def select_card(card_id: int) -> None:
+    st.session_state.selected_card_id = int(card_id)
+    st.session_state.scroll_to_selected_card = True
+
+def render_selected_card_viewer(title: str = "Selected card") -> None:
+    cid = st.session_state.get("selected_card_id")
+    if not cid:
+        return
+    card = fetch_card_by_id(int(cid))
+    if not card:
+        st.session_state.selected_card_id = None
+        return
+
+    anchor_id = f"card_viewer_{card['id']}"
+    st.markdown(f"<div id='{anchor_id}'></div>", unsafe_allow_html=True)
+
+    if st.session_state.get("scroll_to_selected_card", False):
+        st.session_state.scroll_to_selected_card = False  # one-shot
+        components.html(
+            f"""
+<script>
+(function() {{
+  const id = "{anchor_id}";
+  function go() {{
+    const el = window.parent.document.getElementById(id) || document.getElementById(id);
+    if (!el) return;
+    el.scrollIntoView({{ behavior: "smooth", block: "start" }});
+    setTimeout(() => window.parent.scrollBy(0, -80), 120);
+  }}
+  setTimeout(go, 60);
+}})();
+</script>
+            """,
+            height=0,
+        )
+
+    st.markdown(f"### {title} • #{card['id']}")
+    st.caption(f"lang: {card.get('language','')} • created: {card.get('created_at','—')[:19]} • due: {card.get('due_date','—')}")
+    if card.get("tags"):
+        st.markdown(f"<span class='chip'>🏷️ <b>{card['tags']}</b></span>", unsafe_allow_html=True)
+
+    if st.button("Close", key=f"close_card_{card['id']}_viewer"):
+        st.session_state.selected_card_id = None
+        st.rerun()
+
+    meta_left = f"#{card['id']} • {card.get('language','fr')}"
+    meta_right = f"due {card.get('due_date','—')}"
+    render_flashcard_html(front=card.get("front", "") or "", back=card.get("back", "") or "", meta_left=meta_left, meta_right=meta_right, height=360, theme=st.session_state.get("theme", "Dark"))
+
+    extra = []
+    if (card.get("example") or "").strip():
+        extra.append(("Example", card.get("example", "")))
+    if (card.get("notes") or "").strip():
+        extra.append(("Notes", card.get("notes", "")))
+    if extra:
+        with st.expander("More", expanded=False):
+            for k, v in extra:
+                st.markdown(f"**{k}**")
+                st.write(v)
 
 # =========================
 # Pages
 # =========================
+def progress_ring_html(pct: int, label: str, sub: str) -> str:
+    pct = max(0, min(100, int(pct)))
+    return f"""
+<div style="display:flex; align-items:center; gap:14px;">
+  <div style="
+      width:64px; height:64px; border-radius:999px;
+      background: conic-gradient(var(--brand) {pct}%, rgba(0,0,0,.10) 0);
+      display:grid; place-items:center;
+      box-shadow: var(--sh2);
+      border:1px solid var(--line);
+  ">
+    <div style="
+        width:48px; height:48px; border-radius:999px;
+        background: linear-gradient(180deg, var(--surface), var(--surface2));
+        display:grid; place-items:center;
+        font-weight:1000;
+    ">{pct}%</div>
+  </div>
+  <div>
+    <div style="font-weight:1000; font-size:16px;">{label}</div>
+    <div class="small">{sub}</div>
+  </div>
+</div>
+"""
+
 def build_due_calendar_html(days: int = 14) -> str:
     start = today_utc_date()
     counts = []
@@ -1422,7 +1786,7 @@ def build_due_calendar_html(days: int = 14) -> str:
         counts.append((d, c))
         maxc = max(maxc, c)
 
-    t = THEMES.get(st.session_state.get("theme", "Light"), THEMES["Light"])
+    t = THEMES.get(st.session_state.get("theme", "Dark"), THEMES["Dark"])
 
     items = []
     for d, c in counts:
@@ -1480,41 +1844,14 @@ def build_due_calendar_html(days: int = 14) -> str:
 """
     return html
 
-
-def progress_ring_html(pct: int, label: str, sub: str) -> str:
-    pct = max(0, min(100, int(pct)))
-    # Conic-gradient ring
-    return f"""
-<div style="display:flex; align-items:center; gap:14px;">
-  <div style="
-      width:64px; height:64px; border-radius:999px;
-      background: conic-gradient(var(--brand) {pct}%, rgba(0,0,0,.10) 0);
-      display:grid; place-items:center;
-      box-shadow: var(--sh2);
-      border:1px solid var(--line);
-  ">
-    <div style="
-        width:48px; height:48px; border-radius:999px;
-        background: linear-gradient(180deg, var(--surface), var(--surface2));
-        display:grid; place-items:center;
-        font-weight:1000;
-    ">{pct}%</div>
-  </div>
-  <div>
-    <div style="font-weight:1000; font-size:16px;">{label}</div>
-    <div class="small">{sub}</div>
-  </div>
-</div>
-"""
-
-
 def home_page() -> None:
     st.markdown('<div class="page">', unsafe_allow_html=True)
     st.markdown("## Home")
 
-    cards_total = len(fetch_cards())
+    cards_total = count_cards_db()
     due_today = len(fetch_due_cards(today_utc_date()))
-    level, xp_in, xp_need = level_from_xp(int(st.session_state.get("xp", 0)))
+    carrots = int(st.session_state.get("xp", 0) or 0)
+    level, xp_in, xp_need = level_from_xp(carrots)
     pct = 0 if xp_need <= 0 else int(100 * (xp_in / xp_need))
 
     left, right = st.columns([1.35, 1.0], gap="large")
@@ -1522,21 +1859,26 @@ def home_page() -> None:
     with left:
         st.markdown(
             f"""
-<div class="card-header">
-  <div>
-    <div class="h-title">Today’s plan</div>
-    <div class="h-sub">Quick actions to keep momentum.</div>
+<div class="card">
+  <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:12px;">
+    <div>
+      <div class="h-title">Today’s plan</div>
+      <div class="h-sub">Keep momentum with small, consistent actions.</div>
+    </div>
+    <div style="display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end;">
+      <span class="chip">🗂️ <b>Total</b> {cards_total}</span>
+      <span class="chip">📌 <b>Due</b> {due_today}</span>
+    </div>
   </div>
-  <div style="display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end;">
-    <span class="chip">🗂️ <b>Total</b> {cards_total}</span>
-    <span class="chip">📌 <b>Due</b> {due_today}</span>
-  </div>
+  <hr/>
+  {progress_ring_html(pct, f"🥐 Level {level}", f"{xp_in}/{xp_need} 🥕 to next 🥐")}
 </div>
-<hr/>
-{progress_ring_html(pct, f"🥐 Level {level}", f"{xp_in}/{xp_need} 🥕 to next 🥐")}
 """,
             unsafe_allow_html=True,
         )
+
+        # Spacer so the primary actions don’t visually “stick” to the card above.
+        st.markdown('<div style="height:14px"></div>', unsafe_allow_html=True)
 
         c1, c2, c3 = st.columns([1.1, 1.1, 1.0])
         with c1:
@@ -1553,47 +1895,46 @@ def home_page() -> None:
                 st.session_state.nav = "Dictionary"
                 st.rerun()
 
-        st.markdown("</div>", unsafe_allow_html=True)
-
+        st.markdown("")
         st.markdown(
             """
-<div class="card-header">
-  <div>
-    <div class="h-title">Review calendar</div>
-    <div class="h-sub">How many cards will be due each day (next 14 days).</div>
-  </div>
+<div class="card">
+  <div class="h-title">Review calendar</div>
+  <div class="h-sub">How many cards are due each day (next 14 days).</div>
 </div>
 """,
             unsafe_allow_html=True,
         )
         components.html(build_due_calendar_html(14), height=220, scrolling=False)
-        st.markdown("</div>", unsafe_allow_html=True)
 
     with right:
-        st.metric("🔥 Streak", int(st.session_state.get("streak", 1)))
         carrots, croissants, _ = carrots_and_croissants()
-        st.metric("🥕 XP", carrots)
-        st.metric("🥐 Level", croissants)
-        st.metric("📌 Due today", due_today)
-        st.markdown("</div>", unsafe_allow_html=True)
-
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown("</div>", unsafe_allow_html=True)
-
+        st.markdown(
+            f"""
+<div class="card">
+  <div class="h-title">Stats</div>
+  <div class="h-sub">A quick snapshot.</div>
+  <hr/>
+  <div style="display:flex; flex-direction:column; gap:10px;">
+    {chip("🔥","Streak", str(int(st.session_state.get("streak", 1))))}
+    {chip("🥕","XP", str(carrots))}
+    {chip("🥐","Level", str(croissants))}
+    {chip("📌","Due today", str(due_today))}
+  </div>
+</div>
+""",
+            unsafe_allow_html=True,
+        )
 
 def dictionary_page() -> None:
     st.markdown('<div class="page">', unsafe_allow_html=True)
     st.markdown("## Dictionary")
 
-    # st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown(
         """
-<div class="card-header">
-  <div>
-    <div class="h-title">Lookup a word</div>
-    <div class="h-sub">Fast definitions + save as flashcards.</div>
-  </div>
+<div class="card">
+  <div class="h-title">Lookup a word</div>
+  <div class="h-sub">Fast definitions + save as flashcards.</div>
 </div>
 """,
         unsafe_allow_html=True,
@@ -1604,7 +1945,7 @@ def dictionary_page() -> None:
         with colA:
             word = st.text_input("Word / expression", placeholder="ex: faire, pourtant, un peu…")
         with colB:
-            lang = st.selectbox("Language code", ["fr", "en"], index=0, help="Lookup language.")
+            lang = st.selectbox("Language", ["fr", "en"], index=0, help="Lookup language.")
         with colC:
             st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
             do = st.form_submit_button("Search", type="primary", use_container_width=True)
@@ -1622,21 +1963,19 @@ def dictionary_page() -> None:
             unsafe_allow_html=True,
         )
 
-    st.markdown("</div>", unsafe_allow_html=True)
-
     if not (do and word.strip()):
-        st.markdown("</div>", unsafe_allow_html=True)
         return
 
-    source, data = best_dictionary_result(lang, word)
+    with st.spinner("Looking up…"):
+        source, data = best_dictionary_result(lang, word)
 
-    # st.markdown('<div class="card" style="margin-top:12px;">', unsafe_allow_html=True)
+    st.markdown("---")
     if source == "dictapi":
         parsed = data["parsed"]
-        st.success("Source: dictionaryapi.dev (structured)")
+        st.success("Source: dictionaryapi.dev")
 
         if parsed["phonetics"]:
-            st.markdown("### 🔊 Phonetics / audio")
+            st.markdown("### 🔊 Pronunciation")
             for p in parsed["phonetics"][:5]:
                 cols = st.columns([1, 2])
                 with cols[0]:
@@ -1647,23 +1986,21 @@ def dictionary_page() -> None:
                         st.audio(p["audio"])
 
         st.markdown("### 📌 Meanings")
+        primary_def = ""
         for m in parsed["meanings"]:
             st.markdown(f"**{m['partOfSpeech'] or '—'}**")
             defs = m["definitions"] or []
-            for i, d in enumerate(defs[:8], start=1):
+            for i, d in enumerate(defs[:6], start=1):
                 st.markdown(f"**{i}.** {d['definition']}")
                 if d["example"]:
                     st.markdown(f"> _{d['example']}_")
+            if not primary_def and defs:
+                primary_def = defs[0]["definition"]
 
-        default_back = ""
-        if parsed["meanings"] and parsed["meanings"][0]["definitions"]:
-            default_back = parsed["meanings"][0]["definitions"][0]["definition"]
-
-        st.markdown("---")
         st.markdown("### ➕ Save as flashcard")
         with st.form("add_from_dictapi", clear_on_submit=False):
             front = st.text_input("Front", value=word.strip())
-            back = st.text_area("Back", value=default_back, height=110)
+            back = st.text_area("Back", value=primary_def, height=110)
             tags = st.text_input("Tags (comma-separated)", value="dictionary")
             example = st.text_area("Example sentence", value="", height=70)
             notes = st.text_area("Notes", value="", height=70)
@@ -1674,10 +2011,7 @@ def dictionary_page() -> None:
                 else:
                     cid = create_card(lang, front, back, tags, example, notes)
                     bump_xp(1)
-                    st.success(f"Saved card #{cid} and scheduled for review. (+1 🥕)")
-
-        st.markdown("</div>", unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
+                    toast(f"Saved card #{cid}. +1 🥕", icon="🥕")
         return
 
     if source.startswith("wiktionary"):
@@ -1692,7 +2026,6 @@ def dictionary_page() -> None:
             st.write(extract)
         st.caption(f"Endpoint: {data.get('source','')}")
 
-        st.markdown("---")
         st.markdown("### ➕ Save as flashcard")
         with st.form("add_from_wiktionary", clear_on_submit=False):
             front = st.text_input("Front", value=word.strip())
@@ -1707,28 +2040,23 @@ def dictionary_page() -> None:
                 else:
                     cid = create_card(lang, front, back, tags, example, notes)
                     bump_xp(1)
-                    st.success(f"Saved card #{cid} and scheduled for review. (+1 🥕)")
-
-        st.markdown("</div>", unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
+                    toast(f"Saved card #{cid}. +1 🥕", icon="🥕")
         return
 
     st.error("No result from any dictionary backend.")
     st.code(safe_json(data), language="json")
 
-    st.markdown("</div>", unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-
 def review_page() -> None:
+    st.markdown('<div class="page">', unsafe_allow_html=True)
     st.markdown("## Review")
 
-    # --- Difficulty buckets (based on last grade) ---
+    # Which bucket list (if any) the user is browsing in Review.
+    st.session_state.setdefault("review_bucket_view", "")
+
     allc = fetch_cards()
     buckets: Dict[str, List[Dict[str, Any]]] = {"new": [], "difficult": [], "meh": [], "easy": []}
     for row in allc:
-        b = difficulty_bucket(row)
-        buckets.setdefault(b, []).append(row)
+        buckets.setdefault(difficulty_bucket(row), []).append(row)
 
     badge_row([
         ("🆕", f"New {len(buckets['new'])}"),
@@ -1737,58 +2065,104 @@ def review_page() -> None:
         ("😌", f"Easy {len(buckets['easy'])}"),
     ])
 
-    t_new, t_diff, t_meh, t_easy = st.tabs(["🆕 New", "😵 Difficult", "😐 Meh", "😌 Easy"])
+    
+    # Browse buckets (tabs)
+    due_today = fetch_due_cards(today_utc_date())
 
-    def _list_bucket(rows: List[Dict[str, Any]], key_prefix: str) -> None:
-        if not rows:
-            st.info("No cards in this bucket.")
-            return
-        for r in rows[:250]:
-            due = r.get("due_date") or "—"
-            label = (r.get("front", "") or "").strip()
-            if not label:
-                label = f"Card #{r.get('id')}"
-            if st.button(label, key=f"{key_prefix}_open_{r.get('id')}"):
-                select_card(int(r.get("id")))
-                st.rerun()
-            st.caption(f"#{r.get('id')} • due: {due} • tags: {r.get('tags','')}")
+    def _render_bucket_list(cards: List[Dict[str, Any]], key_prefix: str, empty_msg: str):
+        q = st.text_input("Find", value="", placeholder="Type to filter…", key=f"{key_prefix}_q")
+        qn = q.strip().lower()
+        shown = 0
+        for r in cards:
+            front = (r.get("front", "") or "").strip()
+            back = (r.get("back", "") or "").strip()
+            tags = (r.get("tags", "") or "").strip()
+            title = front if front else f"Card #{r.get('id')}"
+            hay = f"{front} {back} {tags}".lower()
+            if qn and qn not in hay:
+                continue
+            shown += 1
+            cols = st.columns([1.6, 1.0, 0.7])
+            with cols[0]:
+                st.markdown(f"**{title}**")
+                if back:
+                    st.caption(textwrap.shorten(back, width=140, placeholder="…"))
+            with cols[1]:
+                st.caption(f"#{r.get('id')} • {tags or '—'}")
+            with cols[2]:
+                if st.button("Open", key=f"{key_prefix}_open_{r.get('id')}", use_container_width=True):
+                    select_card(int(r.get("id")))
+                    st.rerun()
             st.divider()
+        if shown == 0:
+            st.info(empty_msg)
 
-    with t_new:
-        _list_bucket(buckets["new"], "rev_new")
-    with t_diff:
-        _list_bucket(buckets["difficult"], "rev_diff")
-    with t_meh:
-        _list_bucket(buckets["meh"], "rev_meh")
-    with t_easy:
-        _list_bucket(buckets["easy"], "rev_easy")
+    tabs = st.tabs([
+        f"All due ({len(due_today)})",
+        f"🆕 New ({len(buckets['new'])})",
+        f"😵 Difficult ({len(buckets['difficult'])})",
+        f"😐 Meh ({len(buckets['meh'])})",
+        f"😌 Easy ({len(buckets['easy'])})",
+    ])
 
-    st.markdown("</div>", unsafe_allow_html=True)
+    with tabs[0]:
+        _render_bucket_list(
+            due_today,
+            "tab_due",
+            "No cards are due right now."
+        )
 
-    render_selected_card_viewer(title="Selected card")
+    with tabs[1]:
+        _render_bucket_list(
+            buckets.get("new", []),
+            "tab_new",
+            "No cards in New."
+        )
+
+    with tabs[2]:
+        _render_bucket_list(
+            buckets.get("difficult", []),
+            "tab_diff",
+            "No cards in Difficult."
+        )
+
+    with tabs[3]:
+        _render_bucket_list(
+            buckets.get("meh", []),
+            "tab_meh",
+            "No cards in Meh."
+        )
+
+    with tabs[4]:
+        _render_bucket_list(
+            buckets.get("easy", []),
+            "tab_easy",
+            "No cards in Easy."
+        )
+
+
+    st.markdown("")
     colA, colB, colC = st.columns([1.6, 1.0, 1.0])
     with colA:
-        created_on = st.date_input("Show cards created on", value=today_utc_date())
+        created_on = st.date_input("Browse cards created on", value=today_utc_date())
     with colB:
         st.write("")
         if st.button("Restart queue", use_container_width=True):
             st.session_state.review_idx = 0
+            toast("Review queue restarted.", icon="🔁")
             st.rerun()
     with colC:
         st.write("")
         if st.button("Go to Cards", use_container_width=True):
             st.session_state.nav = "Cards"
             st.rerun()
-    st.markdown("</div>", unsafe_allow_html=True)
 
-
-    # --- Browse cards by creation date ---
-    created_cards = fetch_cards_created_on(created_on)
-    with st.expander(f"📅 Cards created on {created_on.isoformat()} ({len(created_cards)})", expanded=False):
+    with st.expander(f"📅 Cards created on {created_on.isoformat()} ({len(fetch_cards_created_on(created_on))})", expanded=False):
+        created_cards = fetch_cards_created_on(created_on)
         if not created_cards:
             st.info("No cards were created on this date.")
         else:
-            for r in created_cards[:250]:
+            for r in created_cards[:200]:
                 label = (r.get("front", "") or "").strip() or f"Card #{r.get('id')}"
                 if st.button(label, key=f"created_open_{r.get('id')}", use_container_width=True):
                     select_card(int(r.get("id")))
@@ -1796,39 +2170,31 @@ def review_page() -> None:
                 st.caption(f"#{r.get('id')} • tags: {r.get('tags','')} • created: {r.get('created_at','—')[:19]}")
                 st.divider()
 
+    if st.session_state.get("selected_card_id"):
+        render_selected_card_viewer(title="Selected card")
 
-    # SM-2 queue is always based on today
+    st.markdown("---")
+
     due = fetch_due_cards(today_utc_date())
     if not due:
         st.success("No cards due. 🎉")
         st.caption("Add more words in Dictionary or Cards.")
-        st.markdown("</div>", unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
         return
 
     idx = int(st.session_state.review_idx)
     idx = max(0, min(idx, len(due) - 1))
     card = due[idx]
 
-    # Stats row
     badge_row([
         ("📌", f"Queue {len(due)}"),
         ("🧾", f"Card {idx+1}/{len(due)}"),
-        ("⏱️", f"Interval {card['interval_days']}d"),
-        ("⚖️", f"Ease {float(card['ease']):.2f}"),
+        ("⏱️", f"Interval {card.get('interval_days',0)}d"),
+        ("⚖️", f"Ease {float(card.get('ease',2.5)):.2f}"),
     ])
-    st.markdown("</div>", unsafe_allow_html=True)
 
     meta_left = f"#{card['id']} • {card.get('language','fr')}"
     meta_right = f"due {card.get('due_date','')}"
-    render_flashcard_html(
-        front=card["front"],
-        back=card["back"],
-        meta_left=meta_left,
-        meta_right=meta_right,
-        height=390,
-        theme=st.session_state.get("theme", "Light"),
-    )
+    render_flashcard_html(front=card["front"], back=card["back"], meta_left=meta_left, meta_right=meta_right, height=390, theme=st.session_state.get("theme", "Dark"))
 
     if (card.get("example") or "").strip() or (card.get("notes") or "").strip():
         c1, c2 = st.columns([1.2, 1.2])
@@ -1840,15 +2206,14 @@ def review_page() -> None:
             if (card.get("notes") or "").strip():
                 st.markdown("**Notes**")
                 st.write(card["notes"])
-        st.markdown("</div>", unsafe_allow_html=True)
 
-    # st.markdown('<div class="card" style="margin-top:12px;">', unsafe_allow_html=True)
     st.markdown("### 🎯 Grade your recall")
-    st.caption("Pick how hard it felt: 5 = very difficult • 1 = very easy")
+    st.caption("5 = very difficult • 1 = very easy (we convert it internally to SM‑2 quality).")
     q_user = st.radio("Difficulty", [1, 2, 3, 4, 5], index=2, horizontal=True)
-    q_sm2 = 6 - int(q_user)  # convert user-facing difficulty (5 hard → 1 easy) into SM-2 quality (1 bad → 5 good)
+    q_sm2 = 6 - int(q_user)
 
-    b1, b2, b3 = st.columns([1.2, 1.2, 1.0])
+    st.markdown('<div class="sticky-bottom">', unsafe_allow_html=True)
+    b1, b2, b3, b4 = st.columns([1.2, 1.1, 1.1, 1.0])
     with b1:
         if st.button("Submit grade", type="primary", use_container_width=True):
             interval, reps, ease = sm2_next(card, q_sm2)
@@ -1860,9 +2225,10 @@ def review_page() -> None:
             if st.session_state.review_idx >= len(due):
                 st.balloons()
                 st.session_state.review_idx = 0
+                toast("Queue complete!", icon="🎉")
             st.rerun()
     with b2:
-        if st.button("Skip (no grade)", use_container_width=True):
+        if st.button("Skip", use_container_width=True):
             st.session_state.review_idx = idx + 1
             if st.session_state.review_idx >= len(due):
                 st.session_state.review_idx = 0
@@ -1871,146 +2237,572 @@ def review_page() -> None:
         if st.button("Back", use_container_width=True):
             st.session_state.review_idx = max(0, idx - 1)
             st.rerun()
+    with b4:
+        if st.button("Open card", use_container_width=True):
+            select_card(int(card["id"]))
+            st.session_state.nav = "Cards"
+            st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("</div>", unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
 
 
 def manage_cards_page() -> None:
     st.markdown('<div class="page">', unsafe_allow_html=True)
     st.markdown("## Cards")
+    st.caption("Search, filter, and manage your flashcards. Tip: type **#123** or **tag:food** in the search box.")
 
-    # st.markdown('<div class="card">', unsafe_allow_html=True)
-    col1, col2, col3 = st.columns([2.0, 1.0, 1.0])
-    with col1:
-        q = st.text_input("Search", placeholder="search front/back/example/notes…")
-    with col2:
-        tags = [""] + all_tags()
-        tag = st.selectbox("Filter by tag", tags, index=0)
-    with col3:
-        st.write("")
-        if st.button("New card", type="primary", use_container_width=True):
-            st.session_state.edit_card_id = None
-    st.markdown("</div>", unsafe_allow_html=True)
+    bp = detect_breakpoint(760)
+    is_mobile = (bp == "m")
 
-    cards = fetch_cards(q, tag)
-    st.caption(f"Cards: {len(cards)}")
+    tags_list = [""] + all_tags()
+    sort_labels = {
+        "Recently updated": "updated_desc",
+        "Due soon": "due_asc",
+        "Newest": "created_desc",
+        "A → Z (front)": "front_asc",
+    }
 
-    # st.markdown('<div class="card" style="margin-top:12px;">', unsafe_allow_html=True)
-    for c in cards[:200]:
-        st.markdown('<div class="card card-tight" style="margin-bottom:10px;">', unsafe_allow_html=True)
-        left, mid, right = st.columns([2.2, 1.6, 1.0])
-        with left:
-            label = (c.get("front","") or "").strip() or f"Card #{c['id']}"
-            if st.button(label, key=f"cards_open_{c['id']}", use_container_width=True):
-                select_card(int(c["id"]))
+    with st.container(border=True):
+        f1, f2, f3, f4, f5 = st.columns([2.2, 1.2, 1.1, 1.1, 1.0])
+        with f1:
+            q = st.text_input(
+                "Search",
+                placeholder="front/back/example/notes…  (examples: #42, tag:verbs)",
+                key="cards_search",
+            )
+        with f2:
+            tag = st.selectbox("Tag", tags_list, index=0, key="cards_tag")
+        with f3:
+            sort_pick = st.selectbox("Sort", list(sort_labels.keys()), index=0, key="cards_sort")
+            order_by = sort_labels.get(sort_pick, "updated_desc")
+        with f4:
+            st.session_state.cards_page_size = st.selectbox(
+                "Page size",
+                [12, 18, 24, 36],
+                index=[12, 18, 24, 36].index(int(st.session_state.get("cards_page_size", 18))),
+                key="cards_page_size_sel",
+            )
+        with f5:
+            st.write("")
+            if st.button("＋ New", type="primary", use_container_width=True):
+                st.session_state.edit_card_id = None
+                st.session_state.selected_card_id = None
+                st.session_state.delete_confirm_id = None
+                st.session_state.scroll_to_editor = True
                 st.rerun()
-            st.caption(f"#{c['id']} • lang: {c.get('language','')} • due: {c.get('due_date','—')}")
-            if c.get("tags"):
-                st.markdown(f"<span class='chip'>🏷️ <b>{c['tags']}</b></span>", unsafe_allow_html=True)
-        with mid:
-            st.markdown("**Back**")
-            b = c.get("back") or ""
-            st.write(b[:240] + ("…" if len(b) > 240 else ""))
-        with right:
-            if st.button("Edit", key=f"edit_{c['id']}", use_container_width=True):
-                st.session_state.edit_card_id = c["id"]
-                st.rerun()
-            if st.button("Delete", key=f"del_{c['id']}", use_container_width=True):
-                delete_card(c["id"])
-                st.success("Deleted.")
-                st.rerun()
 
-    # Full card viewer (opens when you click a card in any list above)
-    render_selected_card_viewer(title="Selected card")
+    # Reset pagination if filters changed
+    prev = st.session_state.get("_cards_filters_prev", None)
+    cur = (q, tag, order_by, int(st.session_state.get("cards_page_size", 18)))
+    if prev != cur:
+        st.session_state.cards_page = 1
+        st.session_state._cards_filters_prev = cur
 
-    st.markdown("</div>", unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
+    # Quick jump / quick tag filter
+    q_eff = q.strip()
+    if q_eff.startswith("#"):
+        try:
+            cid = int(q_eff[1:])
+            c = fetch_card_by_id(cid)
+            if c:
+                select_card(cid)
+                st.session_state.edit_card_id = None
+                st.session_state.cards_search = ""
+                toast(f"Opened card #{cid}.", icon="📌")
+        except Exception:
+            pass
+        q_eff = ""
+    elif q_eff.lower().startswith("tag:"):
+        tag_from_q = q_eff.split(":", 1)[1].strip()
+        if tag_from_q:
+            st.session_state.cards_tag = tag_from_q
+            tag = tag_from_q
+        q_eff = ""
 
-    st.markdown("### ✍️ Editor")
-    # st.markdown('<div class="card">', unsafe_allow_html=True)
+    cards = fetch_cards(q_eff, tag, order_by=order_by)
+    total = len(cards)
 
-    edit_id = st.session_state.get("edit_card_id", None)
-    if edit_id is None:
-        st.info("Create a new card below.")
-        editor_card = {"id": None, "language": "fr", "front": "", "back": "", "tags": "", "example": "", "notes": ""}
-    else:
-        rows = [x for x in fetch_cards() if x["id"] == edit_id]
-        if not rows:
-            st.warning("Card not found.")
-            st.session_state.edit_card_id = None
+    # Pagination
+    page_size = int(st.session_state.get("cards_page_size", 18))
+    pages = max(1, (total + page_size - 1) // page_size)
+    st.session_state.cards_page = max(1, min(int(st.session_state.get("cards_page", 1)), pages))
+
+    top_row = st.columns([1.0, 2.4, 1.0])
+    with top_row[0]:
+        if st.button("◀ Prev", use_container_width=True, disabled=(st.session_state.cards_page <= 1)):
+            st.session_state.cards_page -= 1
             st.rerun()
-        editor_card = rows[0]
+    with top_row[1]:
+        if total == 0:
+            st.markdown("<div class='small' style='text-align:center; padding-top:6px;'>No cards found.</div>", unsafe_allow_html=True)
+        else:
+            a = (st.session_state.cards_page - 1) * page_size + 1
+            b = min(total, st.session_state.cards_page * page_size)
+            st.markdown(
+                f"<div class='small' style='text-align:center; padding-top:6px;'>Showing <b>{a}</b>–<b>{b}</b> of <b>{total}</b> • Page <b>{st.session_state.cards_page}</b> / {pages}</div>",
+                unsafe_allow_html=True,
+            )
+    with top_row[2]:
+        if st.button("Next ▶", use_container_width=True, disabled=(st.session_state.cards_page >= pages)):
+            st.session_state.cards_page += 1
+            st.rerun()
 
-    with st.form("card_editor", clear_on_submit=False):
-        language = st.selectbox("Language", ["fr", "en"], index=0 if editor_card.get("language") == "fr" else 1)
-        front = st.text_input("Front", value=editor_card.get("front", ""))
-        back = st.text_area("Back", value=editor_card.get("back", ""), height=110)
-        tags = st.text_input("Tags (comma-separated)", value=editor_card.get("tags", ""))
-        example = st.text_area("Example sentence", value=editor_card.get("example", ""), height=70)
-        notes = st.text_area("Notes", value=editor_card.get("notes", ""), height=70)
+    start = (st.session_state.cards_page - 1) * page_size
+    end = min(total, start + page_size)
+    rows = cards[start:end]
 
-        submitted = st.form_submit_button("Save", type="primary")
-        if submitted:
-            if not front.strip() or not back.strip():
-                st.warning("Front and Back are required.")
-            else:
-                if editor_card["id"] is None:
-                    cid = create_card(language, front, back, tags, example, notes)
-                    bump_xp(1)
-                    st.success(f"Created card #{cid}. (+1 🥕)")
-                else:
-                    update_card(editor_card["id"], language, front, back, tags, example, notes)
-                    bump_xp(1)
-                    st.success("Updated. (+1 🥕)")
+    def editor_panel() -> None:
+        editor_anchor_id = "cards_editor_anchor"
+        st.markdown(f"<div id='{editor_anchor_id}'></div>", unsafe_allow_html=True)
+
+        # One-shot smooth scroll (triggered by ＋ New)
+        if st.session_state.get("scroll_to_editor", False):
+            st.session_state.scroll_to_editor = False
+            components.html(
+                f"""
+<script>
+(function() {{
+  const id = "{editor_anchor_id}";
+  function go() {{
+    const el = window.parent.document.getElementById(id) || document.getElementById(id);
+    if (!el) return;
+    el.scrollIntoView({{ behavior: "smooth", block: "start" }});
+    // compensate for Streamlit header spacing
+    setTimeout(() => window.parent.scrollBy(0, -80), 120);
+  }}
+  setTimeout(go, 60);
+}})();
+</script>
+""",
+                height=0,
+            )
+
+        st.markdown("### ✍️ Editor")
+        edit_id = st.session_state.get("edit_card_id", None)
+        if edit_id is None:
+            st.caption("Create a new card.")
+            editor_card = {"id": None, "language": "fr", "front": "", "back": "", "tags": "", "example": "", "notes": ""}
+        else:
+            editor_card = fetch_card_by_id(int(edit_id))
+            if not editor_card:
+                st.warning("Card not found.")
                 st.session_state.edit_card_id = None
                 st.rerun()
 
+        form_key = f"card_editor__{edit_id if edit_id is not None else 'new'}__cards_page_v10"
+        with st.form(key=form_key, clear_on_submit=False):
+            language = st.selectbox("Language", ["fr", "en"], index=0 if editor_card.get("language") == "fr" else 1)
+            front = st.text_input("Front", value=editor_card.get("front", ""))
+            back = st.text_area("Back", value=editor_card.get("back", ""), height=110)
+            tags = st.text_input("Tags (comma-separated)", value=editor_card.get("tags", ""))
+            example = st.text_area("Example sentence", value=editor_card.get("example", ""), height=70)
+            notes = st.text_area("Notes", value=editor_card.get("notes", ""), height=70)
 
-    st.markdown("</div>", unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
+            submitted = st.form_submit_button("Save", type="primary")
+            if submitted:
+                if not front.strip() or not back.strip():
+                    st.warning("Front and Back are required.")
+                else:
+                    if editor_card["id"] is None:
+                        cid = create_card(language, front, back, tags, example, notes)
+                        bump_xp(1)
+                        toast(f"Created card #{cid}. +1 🥕", icon="🥕")
+                        select_card(cid)
+                    else:
+                        update_card(int(editor_card["id"]), language, front, back, tags, example, notes)
+                        bump_xp(1)
+                        toast("Updated. +1 🥕", icon="🥕")
+                        select_card(int(editor_card["id"]))
+                    st.session_state.edit_card_id = None
+                    st.rerun()
 
+    def inspector_panel() -> None:
+        with st.container(border=True):
+            st.markdown("### Inspector")
+            if st.session_state.get("selected_card_id"):
+                render_selected_card_viewer(title="Selected card")
+            else:
+                st.caption("Select a card to preview it here.")
+                st.markdown(
+                    "<div class='small'>Pro tips:<br/>• Search <b>#id</b> to jump<br/>• Search <b>tag:xxx</b> to filter<br/>• Keep fronts short; put context in example/notes</div>",
+                    unsafe_allow_html=True,
+                )
+            st.markdown("---")
+            editor_panel()
+
+    def render_tile(c: Dict[str, Any], key_prefix: str = "") -> None:
+        title = (c.get("front", "") or "").strip() or f"Card #{c['id']}"
+        due = c.get("due_date") or "—"
+        lang = c.get("language", "fr")
+
+        with st.container(border=True):
+            st.markdown(f"**{title}**")
+            st.caption(f"#{c['id']} • {lang} • due: {due}")
+
+            if c.get("tags"):
+                st.markdown(f"<span class='chip'>🏷️ <b>{c['tags']}</b></span>", unsafe_allow_html=True)
+
+            back = (c.get("back") or "").strip()
+            if back:
+                st.markdown("<div class='small' style='margin-top:8px; font-weight:850;'>Back</div>", unsafe_allow_html=True)
+                st.write(back[:180] + ("…" if len(back) > 180 else ""))
+
+            confirm_id = st.session_state.get("delete_confirm_id")
+            if confirm_id == c["id"]:
+                st.warning("Delete this card? This cannot be undone.")
+                d1, d2 = st.columns(2)
+                with d1:
+                    if st.button("Yes, delete", key=f"{key_prefix}confirm_del_{c['id']}", use_container_width=True):
+                        delete_card(c["id"])
+                        st.session_state.delete_confirm_id = None
+                        if st.session_state.get("selected_card_id") == c["id"]:
+                            st.session_state.selected_card_id = None
+                        toast("Deleted.", icon="🗑️")
+                        st.rerun()
+                with d2:
+                    if st.button("Cancel", key=f"{key_prefix}cancel_del_{c['id']}", use_container_width=True):
+                        st.session_state.delete_confirm_id = None
+                        st.rerun()
+            else:
+                # On mobile widths, short labels + icons prevent awkward wrapping.
+                # Desktop keeps full labels.
+                if is_mobile:
+                    st.markdown('<div class="card-action-row">', unsafe_allow_html=True)
+                    a1, a2, a3 = st.columns([1, 1, 1], gap="small")
+                    with a1:
+                        if st.button("🟢 Open", help="Open this card", key=f"{key_prefix}cards_open_{c['id']}", type="primary", use_container_width=True):
+                            select_card(int(c["id"]))
+                            st.session_state.edit_card_id = None
+                            st.rerun()
+                    with a2:
+                        if st.button("✏️ Edit", help="Edit this card", key=f"{key_prefix}cards_edit_{c['id']}", use_container_width=True):
+                            st.session_state.edit_card_id = int(c["id"])
+                            select_card(int(c["id"]))
+                            st.session_state.delete_confirm_id = None
+                            st.rerun()
+                    with a3:
+                        if st.button("🗑️ Del", help="Delete (confirm)", key=f"{key_prefix}cards_del_{c['id']}", use_container_width=True):
+                            st.session_state.delete_confirm_id = int(c["id"])
+                            st.rerun()
+
+                    st.markdown('</div>', unsafe_allow_html=True)
+                else:
+                    a1, a2, a3 = st.columns([1.2, 1.0, 1.0])
+                    with a1:
+                        if st.button("Open", key=f"{key_prefix}cards_open_{c['id']}", type="primary", use_container_width=True):
+                            select_card(int(c["id"]))
+                            st.session_state.edit_card_id = None
+                            st.rerun()
+                    with a2:
+                        if st.button("Edit", key=f"{key_prefix}cards_edit_{c['id']}", use_container_width=True):
+                            st.session_state.edit_card_id = int(c["id"])
+                            select_card(int(c["id"]))
+                            st.session_state.delete_confirm_id = None
+                            st.rerun()
+                    with a3:
+                        if st.button("Delete", key=f"{key_prefix}cards_del_{c['id']}", use_container_width=True):
+                            st.session_state.delete_confirm_id = int(c["id"])
+                            st.rerun()
+
+    def grid_panel() -> None:
+        if not rows:
+            st.info("No cards matched your filters. Create your first one with **＋ New**.")
+            return
+        ncol = 1 if is_mobile else 3
+        for i in range(0, len(rows), ncol):
+            cols = st.columns(ncol, gap="large")
+            for j in range(ncol):
+                k = i + j
+                if k >= len(rows):
+                    break
+                with cols[j]:
+                    render_tile(rows[k], key_prefix=f"t_{rows[k]['id']}_")
+
+    # UX change: keep Cards as the primary content.
+    # Inspector + Editor appear *under* the grid (not as a right-side column).
+    grid_panel()
+    st.markdown("---")
+    inspector_panel()
 
 def notebook_page() -> None:
     st.markdown('<div class="page">', unsafe_allow_html=True)
     st.markdown("## Notebook")
-    st.caption("A clean view over saved examples + notes.")
 
-    # st.markdown('<div class="card">', unsafe_allow_html=True)
-    q = st.text_input("Search notebook", placeholder="type anything…")
-    only_with_notes = st.checkbox("Only show items that have example/notes", value=True)
-    st.markdown("</div>", unsafe_allow_html=True)
+    tabs = st.tabs(["📄 PDF reader", "📝 Notes from cards"])
 
-    cards = fetch_cards(q)
-    shown = 0
+    with tabs[0]:
+        st.caption("Upload a PDF book, read it here, and save vocabulary as you go.")
 
-    # st.markdown('<div class="card" style="margin-top:12px;">', unsafe_allow_html=True)
-    for c in cards[:500]:
-        has_any = bool((c.get("example") or "").strip() or (c.get("notes") or "").strip())
-        if only_with_notes and not has_any:
-            continue
-        shown += 1
+        up = st.file_uploader("Upload a PDF", type=["pdf"], key="nb_pdf_uploader")
+        if up is not None:
+            data = up.read()
+            if data:
+                book_id = pdf_book_upsert(up.name, data)
+                st.session_state.nb_pdf_book_id = book_id
+                st.session_state.nb_pdf_page = 1
+                toast(f"Saved PDF: {up.name}", icon="📄")
 
-        st.markdown('<div class="card card-tight" style="margin-bottom:10px;">', unsafe_allow_html=True)
-        st.markdown(f"**{c['front']}**")
-        st.caption(f"#{c['id']} • tags: {c.get('tags','')} • due: {c.get('due_date','—')}")
-        cols = st.columns(2)
-        with cols[0]:
-            if c.get("example"):
-                st.markdown("**Example**")
-                st.markdown(f"> _{c['example']}_")
-        with cols[1]:
-            if c.get("notes"):
-                st.markdown("**Notes**")
-                st.write(c["notes"])
-        st.markdown("</div>", unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
+        books = pdf_books_list()
+        if not books:
+            st.info("No PDF uploaded yet. Upload one above.")
+            return
 
-    if shown == 0:
-        st.info("No notebook entries matched your filters.")
+        book_labels = [f"{b['name']}  ·  {b['uploaded_at'][:19]}" for b in books]
+        id_by_label = {label: b["id"] for label, b in zip(book_labels, books)}
+        cur_id = st.session_state.get("nb_pdf_book_id") or books[0]["id"]
+        cur_idx = next((i for i, b in enumerate(books) if b["id"] == cur_id), 0)
+        pick = st.selectbox("Library", book_labels, index=cur_idx, key="nb_pdf_pick")
+        st.session_state.nb_pdf_book_id = int(id_by_label[pick])
 
-    st.markdown("</div>", unsafe_allow_html=True)
+        book = pdf_book_get(int(st.session_state.nb_pdf_book_id))
+        if not book:
+            st.warning("Could not load that PDF.")
+            return
 
+        # Helpers (callbacks) — keep Prev/Next reliable even with widgets on the same row
+        def _nb_prev() -> None:
+            st.session_state.nb_pdf_page = max(1, int(st.session_state.get("nb_pdf_page", 1)) - 1)
+
+        def _nb_next() -> None:
+            st.session_state.nb_pdf_page = int(st.session_state.get("nb_pdf_page", 1)) + 1
+
+        # Controls row
+        # NOTE: Remove +/- micro-buttons; keep only Prev/Next + direct page input + zoom dropdown.
+        c1, c2, c3, c4, c5 = st.columns([0.95, 0.95, 1.35, 1.45, 1.05], gap="small")
+        with c1:
+            st.markdown("<div class='ctl-label'>&nbsp;</div>", unsafe_allow_html=True)
+            st.button("◀ Prev", use_container_width=True, on_click=_nb_prev)
+        with c2:
+            st.markdown("<div class='ctl-label'>&nbsp;</div>", unsafe_allow_html=True)
+            st.button("Next ▶", use_container_width=True, on_click=_nb_next)
+        with c3:
+            st.markdown("<div class='ctl-label'>Page</div>", unsafe_allow_html=True)
+            st.number_input(
+                "Page",
+                min_value=1,
+                step=1,
+                key="nb_pdf_page",
+                label_visibility="collapsed",
+            )
+        with c4:
+            st.markdown("<div class='ctl-label'>Zoom</div>", unsafe_allow_html=True)
+            zoom_opts = [80, 90, 100, 110, 125, 140, 160]
+            curz = int(st.session_state.get("nb_pdf_zoom", 100))
+            if curz not in zoom_opts:
+                st.session_state.nb_pdf_zoom = 100
+                curz = 100
+            st.selectbox(
+                "Zoom",
+                zoom_opts,
+                index=zoom_opts.index(int(st.session_state.get("nb_pdf_zoom", curz))),
+                key="nb_pdf_zoom",
+                label_visibility="collapsed",
+            )
+        with c5:
+            st.markdown("<div class='ctl-label'>&nbsp;</div>", unsafe_allow_html=True)
+            if st.button("Delete PDF", use_container_width=True):
+                pdf_book_delete(int(book["id"]))
+                st.session_state.nb_pdf_book_id = None
+                st.session_state.nb_pdf_extracted_text = ""
+                st.session_state.nb_pdf_text_cache_page = None
+                st.rerun()
+
+        # Clamp page after any controls/callbacks
+        page = max(1, int(st.session_state.get("nb_pdf_page", 1)))
+        # NOTE: do NOT assign to st.session_state.nb_pdf_page here (it is bound to the number_input widget).
+        zoom = int(st.session_state.get("nb_pdf_zoom", 100))
+
+        use_native = st.toggle(
+            "Selectable PDF view (copy directly from the PDF)",
+            value=st.session_state.get("nb_pdf_use_native", True),
+            key="nb_pdf_use_native",
+            help="Shows the original PDF in your browser so you can highlight/copy text without extracting. Works only if the PDF has a text layer.",
+        )
+
+        if use_native:
+            pdf_selectable_viewer(book["data"], page=page, zoom=zoom, height=820)
+        else:
+            png = render_pdf_page_png(book["data"], page, zoom)
+            if png:
+                st.image(png, use_container_width=True)
+            else:
+                st.warning("PNG preview needs PyMuPDF. Install it with: `pip install pymupdf`")
+
+        st.markdown("### Selectable text (copy)")
+        if fitz is None:
+            st.caption("Install PyMuPDF to extract text: `pip install pymupdf`")
+        else:
+            if st.button("Extract text from this page", use_container_width=True):
+                st.session_state.nb_pdf_text_cache_page = page
+                st.session_state.nb_pdf_extracted_text = extract_pdf_page_text(book["data"], page)
+
+            extracted = st.session_state.get("nb_pdf_extracted_text", "")
+            if extracted and st.session_state.get("nb_pdf_text_cache_page") == page:
+                st.text_area("Page text", value=extracted, height=220)
+                st.download_button(
+                    "Download extracted text (.txt)",
+                    data=extracted.encode("utf-8"),
+                    file_name=f"{book['name']}_page_{page}.txt",
+                    mime="text/plain",
+                    use_container_width=True,
+                )
+
+            # (Google Translate UI is rendered below, always visible)
+            else:
+                st.caption("Click the button to extract text from the current page (optional).")
+
+        # === Google Translate (always available; independent of Extract Text) ===
+        st.markdown("#### Google Translate")
+        st.caption("Translate any word/phrase and auto-fill the Save Vocab form.")
+
+        tcol1, tcol2, tcol3 = st.columns([1.45, 0.6, 0.95], gap="small")
+        with tcol1:
+            st.markdown("<div class='ctl-label'>&nbsp;</div>", unsafe_allow_html=True)
+            to_translate = st.text_input(
+                "Text to translate",
+                value=st.session_state.get("nb_translate_text", ""),
+                key="nb_translate_text",
+                placeholder="ex: pourtant / se rendre compte / une fois…",
+                label_visibility="collapsed",
+            )
+        with tcol2:
+            st.markdown("<div class='ctl-label'>Target</div>", unsafe_allow_html=True)
+            tgt = st.selectbox(
+                "Target",
+                ["en", "de", "fr", "fa"],
+                index=0,
+                key="nb_translate_tgt",
+                label_visibility="collapsed",
+            )
+        with tcol3:
+            st.markdown("<div class='ctl-label'>&nbsp;</div>", unsafe_allow_html=True)
+            do_tr = st.button("Translate", key="nb_translate_btn", type="primary", use_container_width=True)
+
+        if do_tr and to_translate.strip():
+            translation = google_translate(to_translate, source_lang="fr", target_lang=tgt)
+            st.session_state.nb_translate_last = (translation or "").strip()
+            if translation:
+                st.success(translation)
+
+                # Auto-fill "Save vocab" inputs so the user can save/tag immediately.
+                st.session_state["nb_vocab_word"] = to_translate.strip()
+                st.session_state["nb_vocab_meaning"] = translation.strip()
+                st.session_state["nb_vocab_page"] = int(page)
+            else:
+                st.info("Could not fetch an instant translation. Use the Google Translate link below.")
+
+        if to_translate.strip():
+            import urllib.parse as _urlparse
+            q = _urlparse.quote(to_translate.strip())
+            st.markdown(
+                f"[Open in Google Translate ↗](https://translate.google.com/?sl=fr&tl={tgt}&text={q}&op=translate)",
+                unsafe_allow_html=False,
+            )
+
+        st.markdown("---")
+        st.markdown("### 📌 Save vocabulary from this PDF")
+        with st.form("nb_vocab_form", clear_on_submit=True):
+            colA, colB = st.columns([1.0, 1.2])
+            with colA:
+                word = st.text_input(
+                    "Word / expression",
+                    placeholder="ex: pourtant, se rendre compte…",
+                    key="nb_vocab_word",
+                    value=st.session_state.get("nb_vocab_word", ""),
+                )
+                meaning = st.text_input(
+                    "Meaning (EN)",
+                    placeholder="quick meaning…",
+                    key="nb_vocab_meaning",
+                    value=st.session_state.get("nb_vocab_meaning", ""),
+                )
+            with colB:
+                context = st.text_area(
+                    "Context / sentence (optional)",
+                    height=90,
+                    placeholder="Paste the sentence from the book…",
+                    key="nb_vocab_context",
+                    value=st.session_state.get("nb_vocab_context", ""),
+                )
+            page_in = st.number_input(
+                "Page (auto)",
+                min_value=1,
+                value=int(st.session_state.get("nb_vocab_page", page)),
+                step=1,
+                key="nb_vocab_page",
+            )
+            tags_for_cards = st.text_input("Tags for cards (optional)", value="pdf", key="nb_vocab_tags")
+            save = st.form_submit_button("Save vocab", type="primary")
+            if save:
+                if not word.strip():
+                    st.warning("Word is required.")
+                else:
+                    pdf_vocab_add(int(book["id"]), word, meaning, context, int(page_in))
+                    toast("Saved vocab", icon="📌")
+
+        st.markdown("### 📚 Saved vocabulary")
+        q = st.text_input("Search vocab", value=st.session_state.get("nb_vocab_q", ""), key="nb_vocab_q")
+        rows = pdf_vocab_list(int(book["id"]), q=q)
+        if not rows:
+            st.caption("No vocabulary saved yet for this PDF.")
+        else:
+            for r in rows[:200]:
+                with st.container(border=True):
+                    top = st.columns([1.6, 1.1, 0.8, 0.6])
+                    with top[0]:
+                        st.markdown(f"**{r.get('word','')}**")
+                        if (r.get("meaning") or "").strip():
+                            st.caption(r.get("meaning"))
+                    with top[1]:
+                        st.caption(f"p. {r.get('page') or '—'} • {str(r.get('created_at',''))[:19]}")
+                    with top[2]:
+                        if st.button("➕ Card", key=f"v2c_{r['id']}", use_container_width=True):
+                            front = (r.get("word") or "").strip()
+                            back = (r.get("meaning") or "").strip() or (r.get("context") or "").strip() or "—"
+                            notes = (r.get("context") or "").strip()
+                            cid = create_card("fr", front, back, norm_text(tags_for_cards), "", notes)
+                            bump_xp(1)
+                            toast(f"Created card #{cid}. +1 🥕", icon="🥕")
+                    with top[3]:
+                        if st.button("🗑️", key=f"vdel_{r['id']}", use_container_width=True):
+                            pdf_vocab_delete(int(r["id"]))
+                            st.rerun()
+
+                    if (r.get("context") or "").strip():
+                        st.markdown("**Context**")
+                        st.write(r.get("context"))
+
+    with tabs[1]:
+        st.caption("A clean view of saved examples + notes from your flashcards.")
+        q = st.text_input("Search notebook", placeholder="type anything…", key="nb_search")
+        only_with_notes = st.checkbox("Only show items that have example/notes", value=True)
+
+        cards = fetch_cards(q)
+        shown = 0
+        for c in cards[:500]:
+            has_any = bool((c.get("example") or "").strip() or (c.get("notes") or "").strip())
+            if only_with_notes and not has_any:
+                continue
+            shown += 1
+            with st.container(border=True):
+                st.markdown(f"**{c['front']}**")
+                st.caption(f"#{c['id']} • tags: {c.get('tags','')} • due: {c.get('due_date','—')}")
+                cols = st.columns(2)
+                with cols[0]:
+                    if c.get("example"):
+                        st.markdown("**Example**")
+                        st.markdown(f"> _{c['example']}_")
+                with cols[1]:
+                    if c.get("notes"):
+                        st.markdown("**Notes**")
+                        st.write(c["notes"])
+                if st.button("Open", key=f"nb_open_{c['id']}"):
+                    select_card(int(c["id"]))
+                    st.session_state.nav = "Cards"
+                    st.rerun()
+
+        if shown == 0:
+            st.info("No notebook entries matched your filters.")
 
 def import_export_page() -> None:
     st.markdown('<div class="page">', unsafe_allow_html=True)
@@ -2020,7 +2812,6 @@ def import_export_page() -> None:
     col1, col2 = st.columns(2, gap="large")
 
     with col1:
-        # st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown("### Export")
         cards = fetch_cards()
         if st.button("Generate CSV export", type="primary", use_container_width=True):
@@ -2032,14 +2823,12 @@ def import_export_page() -> None:
             st.download_button(
                 "Download CSV",
                 data=out.getvalue().encode("utf-8"),
-                file_name="french_study_hub_cards.csv",
+                file_name="charlot_cards.csv",
                 mime="text/csv",
                 use_container_width=True,
             )
-        st.markdown("</div>", unsafe_allow_html=True)
 
     with col2:
-        # st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown("### Import")
         up = st.file_uploader("Upload CSV", type=["csv"])
         if up is not None:
@@ -2062,20 +2851,15 @@ def import_export_page() -> None:
                         create_card(language, front, back, tags, example, notes)
                         created += 1
                     bump_xp(min(80, created * 2))
-                    st.success(f"Imported {created} cards. (+XP)")
+                    toast(f"Imported {created} cards. (+XP)", icon="📥")
                     st.rerun()
             except Exception as e:
                 st.error(f"Import failed: {e}")
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown("</div>", unsafe_allow_html=True)
-
 
 def settings_page() -> None:
     st.markdown('<div class="page">', unsafe_allow_html=True)
     st.markdown("## Settings")
 
-    # st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown("### Appearance")
     theme_pick = st.selectbox("Theme", ["Light", "Dark"], index=0 if st.session_state.get("theme") == "Light" else 1)
     if theme_pick != st.session_state.get("theme"):
@@ -2090,11 +2874,11 @@ def settings_page() -> None:
     with c1:
         if st.button("Initialize DB", use_container_width=True):
             init_db()
-            st.success("Initialized.")
+            toast("Initialized.", icon="🗄️")
     with c2:
         if st.button("Clear Streamlit cache", use_container_width=True):
             st.cache_data.clear()
-            st.success("Cache cleared.")
+            toast("Cache cleared.", icon="🧹")
     with c3:
         st.info("Tip: DB is local. If you deploy, use persistent storage (volume / cloud DB).")
 
@@ -2110,18 +2894,36 @@ def settings_page() -> None:
                 set_user_state(0, 1, st.session_state.last_xp_date)
             except Exception:
                 pass
-            st.success("Reset.")
+            toast("Reset.", icon="♻️")
             st.rerun()
     with c5:
         lvl, _, _ = level_from_xp(int(st.session_state.get("xp", 0)))
         st.markdown(
-            f"<span class='chip'>🏅 <b>Level</b> {lvl}</span> <span class='chip'>🥕 <b>Carrots</b> {int(st.session_state.get('xp',0) or 0)}</span> <span class='chip'>🥐 <b>Croissants</b> {int(st.session_state.get('xp',0) or 0)//10}</span>",
+            f"{chip('🏅','Level', str(lvl))} {chip('🥕','Carrots', str(int(st.session_state.get('xp',0) or 0)))} {chip('🥐','Croissants', str(int(st.session_state.get('xp',0) or 0)//10))}",
             unsafe_allow_html=True,
         )
 
-    st.markdown("</div>", unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
+def about_page() -> None:
+    st.markdown('<div class="page">', unsafe_allow_html=True)
+    st.markdown("## About")
 
+    st.markdown(
+        """
+<div class="card">
+  <div class="h-title">Charlot</div>
+  <div class="h-sub">A lightweight French study hub: dictionary → flashcards → spaced repetition.</div>
+  <hr/>
+  <div class="small" style="margin-bottom:10px;">
+    • Dictionary: Wiktionary + DictionaryAPI fallbacks<br/>
+    • Flashcards: local SQLite storage<br/>
+    • Review: SM‑2 scheduling (spaced repetition)<br/>
+    • Gamification: 🥕 carrots (XP), 🥐 croissants (levels), 🔥 streak
+  </div>
+  <div class="small">Tip: keep cards short, add an example sentence, and review daily.</div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
 
 # =========================
 # Main
@@ -2130,14 +2932,13 @@ def main() -> None:
     init_db()
     init_session_state()
     sync_session_from_db()
-
-    # Carrots (XP) should reflect cards already created.
     reconcile_carrots_with_cards()
 
-    inject_global_css(st.session_state.get("theme", "Light"))
+    inject_global_css(st.session_state.get("theme", "Dark"))
+    bp = detect_breakpoint(760)
 
-    app_header()
-    nav = top_nav()
+    app_header(bp)
+    nav = top_nav(bp)
 
     if nav == "Home":
         home_page()
@@ -2153,9 +2954,10 @@ def main() -> None:
         import_export_page()
     elif nav == "Settings":
         settings_page()
+    elif nav == "About":
+        about_page()
     else:
         home_page()
-
 
 if __name__ == "__main__":
     main()
