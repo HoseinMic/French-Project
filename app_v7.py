@@ -96,7 +96,7 @@ PAGES = [
     ("📝", "Notes"),
     ("🔁", "Import/Export"),
     ("⚙️", "Settings"),
-    ("❓", "About Charlot"),
+    ("❓", "About"),
 ]
 
 # =========================
