@@ -388,7 +388,7 @@ div[data-testid="stRadio"] label {{
   background: transparent;
   border-radius: 999px;
   padding: 10px 14px;
-  margin: 4px 8px;
+  margin: 4px 6px;
   transition: transform .10s ease, background .12s ease, filter .12s ease;
   color: var(--mut);
   font-weight: 950;
