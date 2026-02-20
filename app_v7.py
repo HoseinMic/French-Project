@@ -1465,12 +1465,9 @@ def app_header(bp: str) -> None:
       <div class="h-sub">Dictionary • Flashcards • Review • Notes</div>
     </div>
     <div style="display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end;">
-      {chip("🔥","Streak", str(streak))}
       {chip("🥕","XP", str(carrots))}
       {chip("🥐","Level", str(level))}
       {chip("🚬","Cigarettes", str(cigarettes))}
-      {chip("📌","Due", str(due_today))}
-      {chip("🗂️","Cards", str(total_cards))}
     </div>
   </div>
 </div>
