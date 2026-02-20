@@ -32,7 +32,7 @@ HTTP_HEADERS = {
     "Accept": "application/json,text/plain;q=0.9,*/*;q=0.8",
 }
 
-# st.set_page_config(page_title=APP_TITLE, page_icon="🇫🇷", layout="wide")
+st.set_page_config(page_title=APP_TITLE, page_icon="🇫🇷", layout="wide")
 
 # st.set_page_config(layout="wide")  # keep wide, then cap container with CSS
 
@@ -387,7 +387,7 @@ div[data-testid="stRadio"] label > div:first-child {{ display: none !important; 
 div[data-testid="stRadio"] label {{
   background: transparent;
   border-radius: 999px;
-  padding: 10px 18px;
+  padding: 10px 14px;
   margin: 4px 8px;
   transition: transform .10s ease, background .12s ease, filter .12s ease;
   color: var(--mut);
