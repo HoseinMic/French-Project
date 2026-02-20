@@ -1,7 +1,6 @@
 
 import csv
 import io
-
 import re
 try:
     import fitz  # PyMuPDF
@@ -230,6 +229,10 @@ div.stButton > button, div.stButton > button * {{
 }}
 .chip b {{ color: var(--txt); font-weight: 1000; }}
 .small {{ font-size: 13px; color: var(--mut); }}
+
+.statline {{ display:flex; justify-content:space-between; align-items:baseline; gap:12px; }}
+.statlabel {{ font-weight: 850; color: var(--txt); }}
+.statvalue {{ font-weight: 900; font-size: 20px; color: var(--txt); }}
 
 hr {{ border-color: var(--line) !important; }}
 
@@ -560,6 +563,17 @@ def bump_xp(amount: int) -> None:
         )
     except Exception:
         pass
+
+def cigarettes_from_xp(xp: int):
+    """5 croissants => 1 cigarette. (1 croissant = 10 carrots) so 1 cigarette = 50 carrots.
+    Returns (cigarettes, croissants_toward_next_cigarette).
+    """
+    carrots = max(0, int(xp or 0))
+    croissants = carrots // 10
+    cigarettes = croissants // 5
+    toward = croissants % 5
+    return cigarettes, toward
+
 
 # =========================
 # DB Layer
@@ -1438,6 +1452,7 @@ def app_header(bp: str) -> None:
     level, xp_in, xp_need = level_from_xp(carrots)
     total_cards = count_cards_db()
     due_today = len(fetch_due_cards(today_utc_date()))
+    cigarettes, cig_toward = cigarettes_from_xp(carrots)
 
     # Header
     with st.container():
@@ -1453,6 +1468,7 @@ def app_header(bp: str) -> None:
       {chip("🔥","Streak", str(streak))}
       {chip("🥕","XP", str(carrots))}
       {chip("🥐","Level", str(level))}
+      {chip("🚬","Cigarettes", str(cigarettes))}
       {chip("📌","Due", str(due_today))}
       {chip("🗂️","Cards", str(total_cards))}
     </div>
@@ -1851,6 +1867,7 @@ def home_page() -> None:
     cards_total = count_cards_db()
     due_today = len(fetch_due_cards(today_utc_date()))
     carrots = int(st.session_state.get("xp", 0) or 0)
+    cigarettes, cig_toward = cigarettes_from_xp(carrots)
     level, xp_in, xp_need = level_from_xp(carrots)
     pct = 0 if xp_need <= 0 else int(100 * (xp_in / xp_need))
 
@@ -1909,17 +1926,34 @@ def home_page() -> None:
 
     with right:
         carrots, croissants, _ = carrots_and_croissants()
+        cigarettes, _cig_toward = cigarettes_from_xp(carrots)
         st.markdown(
             f"""
 <div class="card">
   <div class="h-title">Stats</div>
   <div class="h-sub">A quick snapshot.</div>
   <hr/>
-  <div style="display:flex; flex-direction:column; gap:10px;">
-    {chip("🔥","Streak", str(int(st.session_state.get("streak", 1))))}
-    {chip("🥕","XP", str(carrots))}
-    {chip("🥐","Level", str(croissants))}
-    {chip("📌","Due today", str(due_today))}
+  <div style="display:flex; flex-direction:column; gap:12px;">
+    <div>
+      <div class="statline"><span class="statlabel">🔥 Streak</span><span class="statvalue">{int(st.session_state.get("streak", 1) or 1)}</span></div>
+      <div class="small">Consecutive days you earned at least 1 🥕.</div>
+    </div>
+    <div>
+      <div class="statline"><span class="statlabel">🥕 Carrots</span><span class="statvalue">{carrots}</span></div>
+      <div class="small">Your XP — you earn 🥕 mainly by creating new cards.</div>
+    </div>
+    <div>
+      <div class="statline"><span class="statlabel">🥐 Croissants</span><span class="statvalue">{croissants}</span></div>
+      <div class="small">Every 10 🥕 becomes 1 🥐 (level-up).</div>
+    </div>
+    <div>
+      <div class="statline"><span class="statlabel">🚬 Cigarettes</span><span class="statvalue">{cigarettes}</span></div>
+      <div class="small">Every 5 🥐 becomes 1 🚬 (50 🥕 total).</div>
+    </div>
+    <div>
+      <div class="statline"><span class="statlabel">📌 Due today</span><span class="statvalue">{due_today}</span></div>
+      <div class="small">Cards scheduled to review today.</div>
+    </div>
   </div>
 </div>
 """,
@@ -2850,7 +2884,7 @@ def import_export_page() -> None:
                         notes = norm_text(row.get("notes") or "")
                         create_card(language, front, back, tags, example, notes)
                         created += 1
-                    bump_xp(min(80, created * 2))
+                    bump_xp(min(80, created))
                     toast(f"Imported {created} cards. (+XP)", icon="📥")
                     st.rerun()
             except Exception as e:
@@ -2899,7 +2933,7 @@ def settings_page() -> None:
     with c5:
         lvl, _, _ = level_from_xp(int(st.session_state.get("xp", 0)))
         st.markdown(
-            f"{chip('🏅','Level', str(lvl))} {chip('🥕','Carrots', str(int(st.session_state.get('xp',0) or 0)))} {chip('🥐','Croissants', str(int(st.session_state.get('xp',0) or 0)//10))}",
+            f"{chip('🏅','Level', str(lvl))} {chip('🥕','Carrots', str(int(st.session_state.get('xp',0) or 0)))} {chip('🥐','Croissants', str(int(st.session_state.get('xp',0) or 0)//10))} {chip('🚬','Cigarettes', str(int(st.session_state.get('xp',0) or 0)//50))}",
             unsafe_allow_html=True,
         )
 
