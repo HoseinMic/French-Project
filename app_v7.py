@@ -93,7 +93,7 @@ PAGES = [
     ("📚", "Dictionary"),
     ("🧠", "Review"),
     ("🗂️", "Cards"),
-    ("📝", "Notebook"),
+    ("📝", "Notes"),
     ("🔁", "Import/Export"),
     ("⚙️", "Settings"),
     ("❓", "About"),
