@@ -79,9 +79,9 @@ THEMES = {
 PAGES = [
     ("🏠", "Home"),
     ("📚", "Dictionary"),
-    ("📝", "Notebook"),
     ("🧠", "Review"),
     ("🗂️", "Cards"),
+    ("📝", "Notebook"),
     ("🔁", "Import/Export"),
     ("⚙️", "Settings"),
     ("❓", "About"),
