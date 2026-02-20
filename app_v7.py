@@ -2991,7 +2991,7 @@ def main() -> None:
         review_page()
     elif nav == "Cards":
         manage_cards_page()
-    elif nav == "Notebook":
+    elif nav == "Notes":
         notebook_page()
     elif nav == "Import/Export":
         import_export_page()
