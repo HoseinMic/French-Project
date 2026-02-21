@@ -12,7 +12,6 @@ import base64
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Tuple, Optional
-
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
